@@ -3,6 +3,7 @@
 
 # Object files
 *.o
+!pkg/bpf/bpf_bpfel.o
 *.ko
 *.obj
 *.elf
@@ -44,6 +45,7 @@
 
 # Kernel Module Compile Results
 *.mod*
+!go.mod
 *.cmd
 .tmp_versions/
 modules.order
@@ -53,3 +55,13 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Local build outputs
+bin/
+
+# Local architecture/planning docs
+karaxys_implementation_plan.md
+standalone_ebpf_tracer_plan.md
+
+# Host/kernel generated headers
+bpf/headers/vmlinux.h
