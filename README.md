@@ -28,7 +28,7 @@ App port:    5000
 
 VAmPI is only a test target. The long-term goal is generic application capture similar in spirit to Akto/Kubeshark: any target process/container/workload, with plain HTTP first and TLS plaintext capture later.
 
-## What Works Today
+## What Works
 
 - Loads a generated cilium/ebpf program.
 - Filters capture by target PID in kernel space.
