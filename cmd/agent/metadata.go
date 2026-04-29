@@ -149,17 +149,10 @@ func (f *flowFilter) allow(event ApiEvent, metadataOK bool) bool {
 		return false
 	}
 
-	// For short-lived HTTP sockets, /proc fd metadata can be gone before the
-	// user-space agent resolves it. Classify the whole fd generation once the
-	// first recognizable HTTP request/response chunk appears, then allow all
-	// following body chunks and the close event for that same generation.
 	if event.EventType == eventTypeData && isLikelyHTTPPayload(event.Payload) {
 		f.remember(key, flowDecisionAllow, now)
 		return true
 	}
-
-	// Unknown close-only events and body-only chunks before a flow is classified
-	// are noise from the capture perspective and should not enter Kafka.
 	return false
 }
 

@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/Karaxys/ebpf_tracer/pkg/bpf"
-
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -222,7 +221,7 @@ func isCounterNoise(payload []byte) bool {
 	return true
 }
 
-// ApiEvent represents the JSON structure we send to Kafka
+// ApiEvent represents the JSON structure send to Kafka
 type ApiEvent struct {
 	SchemaVersion string             `json:"schema_version,omitempty"`
 	CaptureSource string             `json:"capture_source,omitempty"`
@@ -346,7 +345,7 @@ func logAgentStats(prefix string, stats *agentStats) {
 }
 
 func main() {
-	// 1. Parse target and production capture controls.
+	// Parse target and production capture controls.
 	targetPID := flag.Int("pid", 0, "The PID of the target application. Required for target-mode=pid or pid-tree")
 	targetModeRaw := flag.String("target-mode", "pid", "Targeting mode: pid, pid-tree, container, all-pids")
 	containerName := flag.String("container", "", "Container name or ID for target-mode=container")
@@ -391,19 +390,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Allow the current process to lock memory for eBPF resources (NFR-6)
+	// Allow the current process to lock memory for eBPF resources
 	if err := bpf.SetRlimit(); err != nil {
 		log.Fatalf("Failed to remove rlimit: %v", err)
 	}
 
-	// 2. Load pre-compiled eBPF objects into the kernel
+	// Load pre-compiled eBPF objects into the kernel
 	objs := bpf.Objects{}
 	if err := bpf.LoadObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading objects: %v", err)
 	}
 	defer objs.Close()
 
-	// 3. Resolve targets and inform the kernel which PIDs to trace.
+	// Resolve targets and inform the kernel which PIDs to trace.
 	targetMgr := newTargetManager(targetConfig{
 		mode:            mode,
 		pid:             *targetPID,
@@ -416,7 +415,7 @@ func main() {
 	}
 	log.Printf("Successfully injected eBPF program. target_mode=%s", mode)
 
-	// 4. Attach tracepoints to the syscalls
+	// Attach tracepoints to the syscalls
 	tpWrite, err := link.Tracepoint("syscalls", "sys_enter_write", objs.TraceSysEnterWrite, nil)
 	if err != nil {
 		log.Fatalf("Opening tracepoint sys_enter_write: %s", err)
@@ -491,7 +490,7 @@ func main() {
 		defer tpAccept4.Close()
 	}
 
-	// 5. Initialize the Kafka Producer (FR-5: Event Brokering)
+	// Initialize the Kafka Producer
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers":            *bootstrapServers,
 		"enable.idempotence":           true,
@@ -533,7 +532,7 @@ func main() {
 		}
 	}()
 
-	// 6. Open the BPF Ring Buffer Reader (NFR-3: Zero-Drop Ingestion)
+	// Open the BPF Ring Buffer Reader
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("Opening ringbuf reader: %s", err)
@@ -570,8 +569,8 @@ func main() {
 		}
 	}()
 
-	// 7. High-Speed Polling Loop
-	var bpfEvent bpf.ApiEvent // Auto-generated struct from our C code
+	// High-Speed Polling Loop
+	var bpfEvent bpf.ApiEvent // Auto-generated struct from C code
 	metadata := newMetadataResolver(*metadataTTL)
 	var flowFilter *flowFilter
 	if *fdFilterEnabled {
