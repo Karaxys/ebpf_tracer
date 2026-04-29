@@ -13,6 +13,7 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 #define MAX_IOVEC_SEGMENTS 6
 #define EVENT_DATA 0
 #define EVENT_CLOSE 1
+#define EVENT_SOCKET 2
 #define DROP_METRIC_MAX 8
 
 enum drop_metric_idx {
@@ -217,14 +218,17 @@ static __always_inline int emit_data_event(__u64 id,
     event->fd = fd;
     event->generation = generation;
     event->seq = next_seq(pid, fd);
-    event->size = final_size;
+    /* size intentionally carries the original payload size. User space clamps
+     * reads to MAX_PAYLOAD_SIZE and marks loss when size exceeds captured bytes.
+     */
+    event->size = count;
     event->chunk_index = chunk_index;
     event->chunk_count = chunk_count;
     event->direction = direction;
     event->event_type = EVENT_DATA;
     event->flags = 0;
 
-    if (bpf_probe_read_user(&event->payload, event->size, buf) < 0) {
+    if (bpf_probe_read_user(&event->payload, final_size, buf) < 0) {
         if (direction == DIR_WRITE) {
             inc_drop(DROP_COPY_WRITE);
         } else {
@@ -323,7 +327,11 @@ static __always_inline int emit_writev_events(__u64 id,
     return 0;
 }
 
-static __always_inline int emit_close_event(__u64 id, __u32 pid, __u32 fd, __u32 generation) {
+static __always_inline int emit_control_event(__u64 id,
+                                              __u32 pid,
+                                              __u32 fd,
+                                              __u32 generation,
+                                              __u8 event_type) {
     struct api_event *event = bpf_ringbuf_reserve(&events, sizeof(struct api_event), 0);
     if (!event) {
         inc_drop(DROP_RINGBUF_RESERVE);
@@ -340,10 +348,18 @@ static __always_inline int emit_close_event(__u64 id, __u32 pid, __u32 fd, __u32
     event->chunk_index = 0;
     event->chunk_count = 0;
     event->direction = DIR_WRITE;
-    event->event_type = EVENT_CLOSE;
+    event->event_type = event_type;
     event->flags = 0;
     bpf_ringbuf_submit(event, 0);
     return 0;
+}
+
+static __always_inline int emit_close_event(__u64 id, __u32 pid, __u32 fd, __u32 generation) {
+    return emit_control_event(id, pid, fd, generation, EVENT_CLOSE);
+}
+
+static __always_inline int emit_socket_event(__u64 id, __u32 pid, __u32 fd, __u32 generation) {
+    return emit_control_event(id, pid, fd, generation, EVENT_SOCKET);
 }
 
 static __always_inline int remember_read_context(__u64 id,
@@ -463,7 +479,7 @@ static __always_inline int emit_read_event(__u64 id, __u32 pid, long ret) {
                         read_ctx->generation,
                         DIR_READ,
                         (const char *)read_ctx->buf_addr,
-                        max_copy,
+                        total_read,
                         0,
                         1);
     } else {
@@ -638,4 +654,34 @@ int trace_sys_exit_recvfrom(void *ctx_void) {
     }
 
     return emit_read_event(id, pid, ctx->ret);
+}
+
+SEC("tracepoint/syscalls/sys_exit_accept")
+int trace_sys_exit_accept(void *ctx_void) {
+    struct sys_exit_ctx *ctx = ctx_void;
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+
+    if (!should_trace(pid) || ctx->ret < 0) {
+        return 0;
+    }
+
+    __u32 fd = (__u32)ctx->ret;
+    __u32 generation = get_or_init_generation(pid, fd);
+    return emit_socket_event(id, pid, fd, generation);
+}
+
+SEC("tracepoint/syscalls/sys_exit_accept4")
+int trace_sys_exit_accept4(void *ctx_void) {
+    struct sys_exit_ctx *ctx = ctx_void;
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+
+    if (!should_trace(pid) || ctx->ret < 0) {
+        return 0;
+    }
+
+    __u32 fd = (__u32)ctx->ret;
+    __u32 generation = get_or_init_generation(pid, fd);
+    return emit_socket_event(id, pid, fd, generation);
 }

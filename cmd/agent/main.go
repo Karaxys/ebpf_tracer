@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -27,8 +28,9 @@ import (
 )
 
 const (
-	eventTypeData  = 0
-	eventTypeClose = 1
+	eventTypeData   = 0
+	eventTypeClose  = 1
+	eventTypeSocket = 2
 
 	dropRingbufReserve = 0
 	dropCopyWrite      = 1
@@ -50,17 +52,23 @@ type fdCacheEntry struct {
 }
 
 type fdClassifier struct {
-	mu    sync.Mutex
-	cache map[fdKey]fdCacheEntry
-	ttl   time.Duration
-	port  int
+	mu              sync.Mutex
+	cache           map[fdKey]fdCacheEntry
+	ttl             time.Duration
+	targetPorts     portSet
+	ignorePorts     portSet
+	captureInbound  bool
+	captureOutbound bool
 }
 
-func newFDClassifier(ttl time.Duration, port int) *fdClassifier {
+func newFDClassifier(ttl time.Duration, targetPorts, ignorePorts portSet, captureInbound, captureOutbound bool) *fdClassifier {
 	return &fdClassifier{
-		cache: make(map[fdKey]fdCacheEntry),
-		ttl:   ttl,
-		port:  port,
+		cache:           make(map[fdKey]fdCacheEntry),
+		ttl:             ttl,
+		targetPorts:     targetPorts,
+		ignorePorts:     ignorePorts,
+		captureInbound:  captureInbound,
+		captureOutbound: captureOutbound,
 	}
 }
 
@@ -97,16 +105,27 @@ func (c *fdClassifier) isAllowed(pid, fd uint32) bool {
 }
 
 func (c *fdClassifier) classifyFD(pid, fd uint32) bool {
-	inode, err := socketInode(pid, fd)
-	if err != nil || inode == "" {
+	conn, ok := resolveConnection(pid, fd)
+	if !ok {
 		return false
 	}
 
-	if matchTCPInode(pid, inode, c.port, false) {
+	if c.ignorePorts.matchesAny(conn.SrcPort, conn.DstPort) {
+		return false
+	}
+
+	if conn.Role == "inbound" && !c.captureInbound {
+		return false
+	}
+	if conn.Role == "outbound" && !c.captureOutbound {
+		return false
+	}
+
+	if len(c.targetPorts) == 0 {
 		return true
 	}
 
-	return matchTCPInode(pid, inode, c.port, true)
+	return c.targetPorts.matchesAny(conn.SrcPort, conn.DstPort)
 }
 
 func socketInode(pid, fd uint32) (string, error) {
@@ -205,19 +224,27 @@ func isCounterNoise(payload []byte) bool {
 
 // ApiEvent represents the JSON structure we send to Kafka
 type ApiEvent struct {
-	Timestamp  uint64 `json:"timestamp"`
-	PID        uint32 `json:"pid"`
-	TID        uint32 `json:"tid"`
-	FD         uint32 `json:"fd"`
-	Generation uint32 `json:"generation"`
-	Seq        uint32 `json:"seq"`
-	ChunkIndex uint16 `json:"chunk_index"`
-	ChunkCount uint16 `json:"chunk_count"`
-	Direction  uint8  `json:"direction"`
-	EventType  uint8  `json:"event_type"`
-	Flags      uint8  `json:"flags"`
-	Size       uint32 `json:"size"`
-	Payload    []byte `json:"payload"`
+	SchemaVersion string             `json:"schema_version,omitempty"`
+	CaptureSource string             `json:"capture_source,omitempty"`
+	CaptureMode   string             `json:"capture_mode,omitempty"`
+	Timestamp     uint64             `json:"timestamp"`
+	PID           uint32             `json:"pid"`
+	TID           uint32             `json:"tid"`
+	FD            uint32             `json:"fd"`
+	Generation    uint32             `json:"generation"`
+	Seq           uint32             `json:"seq"`
+	ChunkIndex    uint16             `json:"chunk_index"`
+	ChunkCount    uint16             `json:"chunk_count"`
+	Direction     uint8              `json:"direction"`
+	EventType     uint8              `json:"event_type"`
+	Flags         uint8              `json:"flags"`
+	OriginalSize  uint32             `json:"original_size,omitempty"`
+	Size          uint32             `json:"size"`
+	Payload       []byte             `json:"payload"`
+	Connection    connectionMetadata `json:"connection,omitempty"`
+	Process       processMetadata    `json:"process,omitempty"`
+	Container     containerMetadata  `json:"container,omitempty"`
+	Loss          lossMetadata       `json:"loss,omitempty"`
 }
 
 type kernelDropSnapshot struct {
@@ -230,19 +257,26 @@ type kernelDropSnapshot struct {
 }
 
 type agentStats struct {
-	ringRecords       uint64
-	decodedEvents     uint64
-	decodeErrors      uint64
-	dataEvents        uint64
-	closeEvents       uint64
-	skippedNoise      uint64
-	skippedFDFilter   uint64
-	marshalErrors     uint64
-	produceErrors     uint64
-	produceAttempts   uint64
-	deliveryFailures  uint64
-	deliverySuccesses uint64
-	ringReadErrors    uint64
+	ringRecords        uint64
+	decodedEvents      uint64
+	decodeErrors       uint64
+	dataEvents         uint64
+	closeEvents        uint64
+	socketEvents       uint64
+	skippedNoise       uint64
+	skippedFDFilter    uint64
+	metadataMisses     uint64
+	truncatedEvents    uint64
+	bytesCaptured      uint64
+	marshalErrors      uint64
+	produceErrors      uint64
+	produceQueueFull   uint64
+	localQueueEnqueued uint64
+	localQueueDropped  uint64
+	produceAttempts    uint64
+	deliveryFailures   uint64
+	deliverySuccesses  uint64
+	ringReadErrors     uint64
 }
 
 func kafkaEventKey(event ApiEvent) []byte {
@@ -286,18 +320,25 @@ func logKernelDropDeltas(prev, curr kernelDropSnapshot) {
 
 func logAgentStats(prefix string, stats *agentStats) {
 	log.Printf(
-		"agent_stats[%s] ring_records=%d decoded=%d decode_errors=%d data=%d close=%d skipped_noise=%d skipped_fd_filter=%d marshal_errors=%d produce_attempts=%d produce_errors=%d delivery_successes=%d delivery_failures=%d ring_read_errors=%d",
+		"agent_stats[%s] ring_records=%d decoded=%d decode_errors=%d data=%d close=%d socket=%d skipped_noise=%d skipped_fd_filter=%d metadata_misses=%d truncated=%d bytes_captured=%d marshal_errors=%d local_queue_enqueued=%d local_queue_dropped=%d produce_attempts=%d produce_errors=%d produce_queue_full=%d delivery_successes=%d delivery_failures=%d ring_read_errors=%d",
 		prefix,
 		atomic.LoadUint64(&stats.ringRecords),
 		atomic.LoadUint64(&stats.decodedEvents),
 		atomic.LoadUint64(&stats.decodeErrors),
 		atomic.LoadUint64(&stats.dataEvents),
 		atomic.LoadUint64(&stats.closeEvents),
+		atomic.LoadUint64(&stats.socketEvents),
 		atomic.LoadUint64(&stats.skippedNoise),
 		atomic.LoadUint64(&stats.skippedFDFilter),
+		atomic.LoadUint64(&stats.metadataMisses),
+		atomic.LoadUint64(&stats.truncatedEvents),
+		atomic.LoadUint64(&stats.bytesCaptured),
 		atomic.LoadUint64(&stats.marshalErrors),
+		atomic.LoadUint64(&stats.localQueueEnqueued),
+		atomic.LoadUint64(&stats.localQueueDropped),
 		atomic.LoadUint64(&stats.produceAttempts),
 		atomic.LoadUint64(&stats.produceErrors),
+		atomic.LoadUint64(&stats.produceQueueFull),
 		atomic.LoadUint64(&stats.deliverySuccesses),
 		atomic.LoadUint64(&stats.deliveryFailures),
 		atomic.LoadUint64(&stats.ringReadErrors),
@@ -305,17 +346,49 @@ func logAgentStats(prefix string, stats *agentStats) {
 }
 
 func main() {
-	// 1. Parse target PID from command line (FR-2: Target Filtering)
-	targetPID := flag.Int("pid", 0, "The PID of the target application (e.g., Node.js/Podman)")
+	// 1. Parse target and production capture controls.
+	targetPID := flag.Int("pid", 0, "The PID of the target application. Required for target-mode=pid or pid-tree")
+	targetModeRaw := flag.String("target-mode", "pid", "Targeting mode: pid, pid-tree, container, all-pids")
+	containerName := flag.String("container", "", "Container name or ID for target-mode=container")
+	targetRefreshInterval := flag.Duration("target-refresh-interval", 5*time.Second, "Target PID refresh interval for dynamic workers/containers")
+	allowAllPIDs := flag.Bool("allow-all-pids", false, "Required safety acknowledgement for target-mode=all-pids")
 	bootstrapServers := flag.String("kafka-bootstrap", "localhost:9092", "Kafka bootstrap servers")
 	topicName := flag.String("topic", "raw-network-traffic", "Kafka topic for raw events")
-	targetPort := flag.Int("target-port", 0, "Only forward TCP traffic matching this port. Use 0 to allow any TCP port")
-	enableUserFDFilter := flag.Bool("enable-user-fd-filter", false, "Enable user-space fd/port filtering via /proc (debug mode)")
+	targetPort := flag.Int("target-port", 0, "Deprecated: single target TCP port. Prefer -target-ports")
+	targetPortsRaw := flag.String("target-ports", "", "Comma-separated TCP ports to capture. Empty allows any non-ignored socket port")
+	ignorePortsRaw := flag.String("ignore-ports", "9092,27017,6379", "Comma-separated TCP ports to ignore by default, e.g. Kafka/Mongo/Redis")
+	fdFilterEnabled := flag.Bool("fd-filter", true, "Enable default user-space socket/port FD filtering via /proc")
+	allowNonSocketFDs := flag.Bool("allow-non-socket-fds", false, "Debug mode: forward non-socket FDs instead of default socket-only capture")
+	captureInbound := flag.Bool("capture-inbound", true, "Capture inbound/server-side socket traffic")
+	captureOutbound := flag.Bool("capture-outbound", true, "Capture outbound/client-side socket traffic")
 	statsInterval := flag.Duration("stats-interval", 10*time.Second, "Periodic agent/kernel stats log interval")
+	metadataTTL := flag.Duration("metadata-cache-ttl", 15*time.Second, "Connection/process/container metadata cache TTL")
+	kafkaQueueMessages := flag.Int("kafka-queue-max-messages", 200000, "Kafka producer queue.buffering.max.messages")
+	kafkaQueueKBytes := flag.Int("kafka-queue-max-kbytes", 262144, "Kafka producer queue.buffering.max.kbytes")
+	localQueueEvents := flag.Int("local-queue-events", 50000, "Bounded in-agent queue size before Kafka producer")
+	backpressureRaw := flag.String("backpressure-mode", "best-effort", "Backpressure mode: best-effort, strict, drop-newest, drop-oldest")
+	healthAddr := flag.String("health-addr", "127.0.0.1:7071", "HTTP health/metrics listen address; empty disables")
 	flag.Parse()
 
-	if *targetPID == 0 {
-		log.Fatalf("Please provide a target PID using -pid <PID>")
+	mode, err := parseTargetMode(*targetModeRaw)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	targetPorts, err := parsePortSet(*targetPortsRaw)
+	if err != nil {
+		log.Fatalf("invalid -target-ports: %v", err)
+	}
+	if *targetPort > 0 {
+		targetPorts[*targetPort] = struct{}{}
+	}
+	ignorePorts, err := parsePortSet(*ignorePortsRaw)
+	if err != nil {
+		log.Fatalf("invalid -ignore-ports: %v", err)
+	}
+	backpressure, err := parseBackpressureMode(*backpressureRaw)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	// Allow the current process to lock memory for eBPF resources (NFR-6)
@@ -330,13 +403,18 @@ func main() {
 	}
 	defer objs.Close()
 
-	// 3. Inform the kernel which PID to trace by updating the target_pids map
-	pidUint32 := uint32(*targetPID)
-	traceFlag := uint8(1)
-	if err := objs.TargetPids.Put(&pidUint32, &traceFlag); err != nil {
-		log.Fatalf("Failed to add target PID to map: %v", err)
+	// 3. Resolve targets and inform the kernel which PIDs to trace.
+	targetMgr := newTargetManager(targetConfig{
+		mode:            mode,
+		pid:             *targetPID,
+		container:       *containerName,
+		refreshInterval: *targetRefreshInterval,
+		allowAllPIDs:    *allowAllPIDs,
+	}, objs.TargetPids)
+	if _, err := targetMgr.refresh(); err != nil {
+		log.Fatalf("Failed to resolve initial targets: %v", err)
 	}
-	log.Printf("Successfully injected eBPF program. Filtering for PID: %d", *targetPID)
+	log.Printf("Successfully injected eBPF program. target_mode=%s", mode)
 
 	// 4. Attach tracepoints to the syscalls
 	tpWrite, err := link.Tracepoint("syscalls", "sys_enter_write", objs.TraceSysEnterWrite, nil)
@@ -399,14 +477,28 @@ func main() {
 	}
 	defer tpClose.Close()
 
+	tpAccept, err := link.Tracepoint("syscalls", "sys_exit_accept", objs.TraceSysExitAccept, nil)
+	if err != nil {
+		log.Printf("Opening tracepoint sys_exit_accept failed: %s", err)
+	} else {
+		defer tpAccept.Close()
+	}
+
+	tpAccept4, err := link.Tracepoint("syscalls", "sys_exit_accept4", objs.TraceSysExitAccept4, nil)
+	if err != nil {
+		log.Printf("Opening tracepoint sys_exit_accept4 failed: %s", err)
+	} else {
+		defer tpAccept4.Close()
+	}
+
 	// 5. Initialize the Kafka Producer (FR-5: Event Brokering)
 	p, err := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers":            *bootstrapServers,
 		"enable.idempotence":           true,
 		"acks":                         "all",
 		"compression.type":             "lz4",
-		"queue.buffering.max.messages": 200000,
-		"queue.buffering.max.kbytes":   262144,
+		"queue.buffering.max.messages": *kafkaQueueMessages,
+		"queue.buffering.max.kbytes":   *kafkaQueueKBytes,
 		"queue.buffering.max.ms":       10,
 	})
 	if err != nil {
@@ -416,6 +508,17 @@ func main() {
 
 	// Go routine to handle Kafka delivery reports asynchronously
 	stats := &agentStats{}
+	queuedProducer := newQueuedProducer(p, *topicName, backpressure, *localQueueEvents, stats)
+	defer queuedProducer.close()
+	log.Printf("Producer backpressure configured mode=%s local_queue_events=%d kafka_queue_messages=%d kafka_queue_kbytes=%d", backpressure, *localQueueEvents, *kafkaQueueMessages, *kafkaQueueKBytes)
+	if *healthAddr != "" {
+		healthSrv := startHealthServer(*healthAddr, stats, queuedProducer)
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = healthSrv.Shutdown(ctx)
+		}()
+	}
 	go func() {
 		for e := range p.Events() {
 			switch ev := e.(type) {
@@ -444,6 +547,10 @@ func main() {
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(stopper)
 
+	stopCh := make(chan struct{})
+	go targetMgr.run(stopCh)
+	defer close(stopCh)
+
 	go func() {
 		<-stopper
 		log.Println("Received signal, exiting...")
@@ -465,10 +572,13 @@ func main() {
 
 	// 7. High-Speed Polling Loop
 	var bpfEvent bpf.ApiEvent // Auto-generated struct from our C code
-	var fdFilter *fdClassifier
-	if *enableUserFDFilter {
-		fdFilter = newFDClassifier(15*time.Second, *targetPort)
-		log.Printf("User-space fd filter enabled (port=%d)", *targetPort)
+	metadata := newMetadataResolver(*metadataTTL)
+	var flowFilter *flowFilter
+	if *fdFilterEnabled {
+		flowFilter = newFlowFilter(*metadataTTL, targetPorts, ignorePorts, *captureInbound, *captureOutbound)
+		log.Printf("Flow filter enabled target_ports=%v ignore_ports=%v inbound=%t outbound=%t", sortedPortSet(targetPorts), sortedPortSet(ignorePorts), *captureInbound, *captureOutbound)
+	} else if *allowNonSocketFDs {
+		log.Printf("WARNING: fd filter disabled and non-socket FDs allowed; use only for debugging")
 	}
 
 loop:
@@ -499,26 +609,50 @@ loop:
 			payloadSize = len(bpfEvent.Payload)
 		}
 
-		event := ApiEvent{
-			Timestamp:  bpfEvent.Timestamp,
-			PID:        bpfEvent.Pid,
-			TID:        bpfEvent.Tid,
-			FD:         bpfEvent.Fd,
-			Generation: bpfEvent.Generation,
-			Seq:        bpfEvent.Seq,
-			ChunkIndex: bpfEvent.ChunkIndex,
-			ChunkCount: bpfEvent.ChunkCount,
-			Direction:  bpfEvent.Direction,
-			EventType:  bpfEvent.EventType,
-			Flags:      bpfEvent.Flags,
-			Size:       uint32(payloadSize),
-			Payload:    bpfEvent.Payload[:payloadSize],
+		originalSize := bpfEvent.Size
+		capturedSize := uint32(payloadSize)
+		loss := lossMetadata{}
+		if originalSize > capturedSize {
+			loss = lossMetadata{Truncated: true, OriginalSize: originalSize, CapturedSize: capturedSize, Reason: "payload_exceeded_agent_struct_size"}
+			atomic.AddUint64(&stats.truncatedEvents, 1)
 		}
+
+		conn, proc, container, metadataOK := metadata.resolve(bpfEvent.Pid, bpfEvent.Fd)
+		if !metadataOK && bpfEvent.Fd > 2 {
+			atomic.AddUint64(&stats.metadataMisses, 1)
+		}
+
+		event := ApiEvent{
+			SchemaVersion: "raw.v1",
+			CaptureSource: "ebpf",
+			CaptureMode:   string(mode),
+			Timestamp:     bpfEvent.Timestamp,
+			PID:           bpfEvent.Pid,
+			TID:           bpfEvent.Tid,
+			FD:            bpfEvent.Fd,
+			Generation:    bpfEvent.Generation,
+			Seq:           bpfEvent.Seq,
+			ChunkIndex:    bpfEvent.ChunkIndex,
+			ChunkCount:    bpfEvent.ChunkCount,
+			Direction:     bpfEvent.Direction,
+			EventType:     bpfEvent.EventType,
+			Flags:         bpfEvent.Flags,
+			OriginalSize:  originalSize,
+			Size:          capturedSize,
+			Payload:       bpfEvent.Payload[:payloadSize],
+			Connection:    conn,
+			Process:       proc,
+			Container:     container,
+			Loss:          loss,
+		}
+		atomic.AddUint64(&stats.bytesCaptured, uint64(capturedSize))
 		switch event.EventType {
 		case eventTypeData:
 			atomic.AddUint64(&stats.dataEvents, 1)
 		case eventTypeClose:
 			atomic.AddUint64(&stats.closeEvents, 1)
+		case eventTypeSocket:
+			atomic.AddUint64(&stats.socketEvents, 1)
 		}
 
 		if event.EventType == eventTypeData && isCounterNoise(event.Payload) {
@@ -526,7 +660,14 @@ loop:
 			continue
 		}
 
-		if fdFilter != nil && event.EventType != eventTypeClose && !fdFilter.isAllowed(event.PID, event.FD) {
+		if flowFilter != nil && !flowFilter.allow(event, metadataOK) {
+			atomic.AddUint64(&stats.skippedFDFilter, 1)
+			continue
+		}
+		if event.EventType == eventTypeSocket {
+			continue
+		}
+		if flowFilter == nil && !*allowNonSocketFDs && event.FD <= 2 {
 			atomic.AddUint64(&stats.skippedFDFilter, 1)
 			continue
 		}
@@ -538,18 +679,7 @@ loop:
 			continue
 		}
 
-		// Push to Kafka non-blockingly
-		atomic.AddUint64(&stats.produceAttempts, 1)
-		err = p.Produce(&kafka.Message{
-			TopicPartition: kafka.TopicPartition{Topic: topicName, Partition: kafka.PartitionAny},
-			Key:            kafkaEventKey(event),
-			Value:          jsonBytes,
-		}, nil)
-
-		if err != nil {
-			atomic.AddUint64(&stats.produceErrors, 1)
-			log.Printf("Failed to produce to Kafka: %v", err)
-		}
+		queuedProducer.submit(kafkaEventKey(event), jsonBytes)
 	}
 
 	logAgentStats("shutdown", stats)

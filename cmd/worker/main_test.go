@@ -231,6 +231,7 @@ func testConfig(out *bytes.Buffer) config {
 		maxBodyBytes:   defaultMaxBodyBytes,
 		maxStreamBytes: defaultMaxStreamBytes,
 		prettyOutput:   false,
+		outputContract: "legacy",
 		output:         out,
 	}
 }
@@ -249,6 +250,89 @@ func testEvent(seq uint32, direction uint8, payload []byte) ApiEvent {
 		EventType:  eventTypeData,
 		Size:       uint32(len(payload)),
 		Payload:    payload,
+	}
+}
+
+func TestProcessEventEmitsCleanNormalizedContract(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	cfg.outputContract = "normalized"
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	processEvent(store, cfg, stats, testEvent(1, directionRead, []byte("GET /api HTTP/1.1\r\nHost: juice.local\r\n\r\n")))
+	processEvent(store, cfg, stats, testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}")))
+
+	var normalized NormalizedConversation
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &normalized); err != nil {
+		t.Fatalf("failed to decode normalized output: %v\nraw=%s", err, out.String())
+	}
+	if normalized.HTTP.Request.Method != http.MethodGet || normalized.HTTP.Request.Path != "/api" {
+		t.Fatalf("unexpected normalized request: %+v", normalized.HTTP.Request)
+	}
+	if normalized.HTTP.Response.Status != "200 OK" || normalized.HTTP.Response.Body != "{}" {
+		t.Fatalf("unexpected normalized response: %+v", normalized.HTTP.Response)
+	}
+}
+
+func TestProcessEventEmitsNormalizedMetadata(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	req := testEvent(1, directionRead, []byte("GET /api HTTP/1.1\r\nHost: juice.local\r\n\r\n"))
+	req.CaptureSource = "ebpf"
+	req.CaptureMode = "container"
+	req.Connection = ConnectionMetadata{SrcIP: "10.0.0.2", SrcPort: 3000, DstIP: "10.0.0.1", DstPort: 52144, Protocol: "tcp", Family: "ipv4", Role: "inbound"}
+	req.Process = ProcessMetadata{PID: 100, Name: "node", Exe: "/usr/local/bin/node"}
+	req.Container = ContainerMetadata{ID: "abc123", Name: "juice-shop"}
+
+	resp := testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"))
+	resp.Connection = req.Connection
+	resp.Process = req.Process
+	resp.Container = req.Container
+
+	processEvent(store, cfg, stats, req)
+	processEvent(store, cfg, stats, resp)
+
+	conversation := decodeSingleConversation(t, out.String())
+	if conversation.SchemaVersion != "http.conversation.v1" {
+		t.Fatalf("unexpected schema version: %s", conversation.SchemaVersion)
+	}
+	if conversation.CaptureSource != "ebpf" || conversation.CaptureMode != "container" {
+		t.Fatalf("unexpected capture metadata: source=%s mode=%s", conversation.CaptureSource, conversation.CaptureMode)
+	}
+	if conversation.Connection.SrcIP != "10.0.0.2" || conversation.Connection.DstPort != 52144 {
+		t.Fatalf("unexpected connection metadata: %+v", conversation.Connection)
+	}
+	if conversation.Process.Name != "node" || conversation.Container.ID != "abc123" {
+		t.Fatalf("unexpected process/container metadata: proc=%+v container=%+v", conversation.Process, conversation.Container)
+	}
+	if conversation.Request.Body != conversation.ReqBody || conversation.Response.Status != conversation.RespStatus {
+		t.Fatalf("nested request/response fields are not aligned with compatibility fields")
+	}
+}
+
+func TestProcessEventPropagatesLossMetadata(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	req := testEvent(1, directionRead, []byte("GET /large HTTP/1.1\r\nHost: api.local\r\n\r\n"))
+	req.Loss = LossMetadata{Truncated: true, OriginalSize: 8192, CapturedSize: 4096, Reason: "payload_exceeded_agent_struct_size"}
+	resp := testEvent(3, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"))
+
+	processEvent(store, cfg, stats, req)
+	processEvent(store, cfg, stats, resp)
+
+	conversation := decodeSingleConversation(t, out.String())
+	if !conversation.Loss.Truncated {
+		t.Fatalf("expected truncation metadata")
+	}
+	if !conversation.Loss.SequenceGap || conversation.Loss.ExpectedNextSeq != 2 || conversation.Loss.ActualSeq != 3 {
+		t.Fatalf("unexpected sequence gap metadata: %+v", conversation.Loss)
 	}
 }
 

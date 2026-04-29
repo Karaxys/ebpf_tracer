@@ -17,6 +17,7 @@ func parseConfig() config {
 	maxStreamBytes := flag.Int("max-stream-bytes", defaultMaxStreamBytes, "Max buffered bytes per request/response stream before reset")
 	pretty := flag.Bool("pretty", true, "Pretty-print conversation output")
 	debugPayload := flag.Bool("debug-payload", false, "Log short escaped payload previews while routing events")
+	outputContract := flag.String("output-contract", "normalized", "Output contract: normalized, legacy, or both")
 	flag.Parse()
 
 	if *offsetReset != "latest" && *offsetReset != "earliest" {
@@ -31,6 +32,10 @@ func parseConfig() config {
 		log.Fatalf("-max-stream-bytes must be > 0")
 	}
 
+	if *outputContract != "normalized" && *outputContract != "legacy" && *outputContract != "both" {
+		log.Fatalf("Invalid -output-contract value %q, expected normalized, legacy, or both", *outputContract)
+	}
+
 	return config{
 		bootstrapServers: *bootstrap,
 		topic:            *topic,
@@ -42,6 +47,7 @@ func parseConfig() config {
 		maxStreamBytes:   *maxStreamBytes,
 		prettyOutput:     *pretty,
 		debugPayload:     *debugPayload,
+		outputContract:   *outputContract,
 		output:           os.Stdout,
 	}
 }

@@ -16,7 +16,10 @@ import (
 )
 
 func sessionKey(event ApiEvent) string {
-	return fmt.Sprintf("%d-%d-%d", event.PID, event.FD, event.Generation)
+	if event.Connection.Protocol != "" && event.Connection.SrcIP != "" && event.Connection.DstIP != "" {
+		return fmt.Sprintf("conn:%s:%s:%d-%s:%d:%d", event.Connection.Protocol, event.Connection.SrcIP, event.Connection.SrcPort, event.Connection.DstIP, event.Connection.DstPort, event.Generation)
+	}
+	return fmt.Sprintf("pidfd:%d-%d-%d", event.PID, event.FD, event.Generation)
 }
 
 func processEvent(store *sessionStore, cfg config, stats *workerStats, event ApiEvent) {
@@ -52,8 +55,18 @@ func processEvent(store *sessionStore, cfg config, stats *workerStats, event Api
 	defer state.mu.Unlock()
 
 	state.LastActive = time.Now()
+	mergeStreamMetadata(state, event)
 	if state.LastSeq != 0 && event.Seq > state.LastSeq+1 {
 		atomic.AddUint64(&stats.outOfOrder, 1)
+		state.Loss.SequenceGap = true
+		state.Loss.ExpectedNextSeq = state.LastSeq + 1
+		state.Loss.ActualSeq = event.Seq
+	}
+	if event.Loss.Truncated {
+		state.Loss.Truncated = true
+		state.Loss.OriginalSize = event.Loss.OriginalSize
+		state.Loss.CapturedSize = event.Loss.CapturedSize
+		state.Loss.Reason = event.Loss.Reason
 	}
 	if event.Seq >= state.LastSeq {
 		state.LastSeq = event.Seq
@@ -131,6 +144,24 @@ func handleCloseEvent(store *sessionStore, cfg config, stats *workerStats, event
 
 	store.remove(key)
 	atomic.AddUint64(&stats.closedSessions, 1)
+}
+
+func mergeStreamMetadata(state *StreamState, event ApiEvent) {
+	if state.CaptureSource == "" {
+		state.CaptureSource = event.CaptureSource
+	}
+	if state.CaptureMode == "" {
+		state.CaptureMode = event.CaptureMode
+	}
+	if state.Connection.Protocol == "" {
+		state.Connection = event.Connection
+	}
+	if state.Process.PID == 0 {
+		state.Process = event.Process
+	}
+	if state.Container.ID == "" {
+		state.Container = event.Container
+	}
 }
 
 func classifyPayload(chunk []byte) payloadKind {
@@ -222,7 +253,17 @@ func drainParsedConversations(cfg config, stats *workerStats, state *StreamState
 			break
 		}
 		atomic.AddUint64(&stats.requestParsed, 1)
-		state.PendingReqs = append(state.PendingReqs, parsedRequest{req: req, body: reqBody, capturedAt: time.Now().UTC()})
+		state.PendingReqs = append(state.PendingReqs, parsedRequest{
+			req:           req,
+			body:          reqBody,
+			capturedAt:    time.Now().UTC(),
+			captureSource: state.CaptureSource,
+			captureMode:   state.CaptureMode,
+			connection:    state.Connection,
+			process:       state.Process,
+			container:     state.Container,
+			loss:          state.Loss,
+		})
 		state.ReqData = state.ReqData[consumed:]
 	}
 
@@ -241,13 +282,30 @@ func drainParsedConversations(cfg config, stats *workerStats, state *StreamState
 			break
 		}
 		atomic.AddUint64(&stats.responseParsed, 1)
-		emitConversation(cfg, state.PendingReqs[0], resp, respBody)
+		parsedReq := state.PendingReqs[0]
+		parsedReq.loss = mergeLossMetadata(parsedReq.loss, state.Loss)
+		emitConversation(cfg, parsedReq, resp, respBody)
 		parsedCount++
 		state.PendingReqs = state.PendingReqs[1:]
 		state.RespData = state.RespData[consumed:]
 	}
 
 	return parsedCount
+}
+
+func mergeLossMetadata(base, latest LossMetadata) LossMetadata {
+	if latest.Truncated {
+		base.Truncated = true
+		base.OriginalSize = latest.OriginalSize
+		base.CapturedSize = latest.CapturedSize
+		base.Reason = latest.Reason
+	}
+	if latest.SequenceGap {
+		base.SequenceGap = true
+		base.ExpectedNextSeq = latest.ExpectedNextSeq
+		base.ActualSeq = latest.ActualSeq
+	}
+	return base
 }
 
 func parseOneRequest(data []byte, maxBodyBytes int64) (*http.Request, string, int, bool) {

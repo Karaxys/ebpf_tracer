@@ -341,7 +341,72 @@ Then rebuild:
 ```bash
 go build -o bin/agent ./cmd/agent
 ```
+## Sample Output
 
+```json
+{
+  "_id": {
+    "$oid": "6c9ae5a4e3c915a3fe894eb4"
+  },
+  "schema_version": "http.v1",
+  "capture_source": "ebpf",
+  "capture_mode": "container",
+  "captured_at": {
+    "$date": "2026-04-29T16:56:55.061966271Z"
+  },
+  "connection": {},
+  "process": {
+    "pid": 60129,
+    "name": "python",
+    "exe": "/usr/local/bin/python3.11"
+  },
+  "container": {
+    "id": "f83a527c8a7f87d004d4361bfcdccc5d207f0edb2ff2f504d652300c5d7385b8"
+  },
+  "loss": {},
+  "http": {
+    "request": {
+      "method": "POST",
+      "url": "http://127.0.0.1:3000/users/v1/login",
+      "host": "127.0.0.1:3000",
+      "path": "/users/v1/login",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Content-Length": [
+          "49"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "curl/8.19.0"
+        ]
+      },
+      "body": "{\n  \"username\": \"tracer\",\n  \"password\": \"password123\"\n}"
+    },
+    "response": {
+      "status": "200 OK",
+      "headers": {
+        "Content-Length": [
+          "225"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "Date": [
+          "Wed, 29 Apr 2026 16:56:56 GMT"
+        ],
+        "Server": [
+          "Werkzeug/2.2.3 Python/3.11.15"
+        ]
+      },
+      "body": "{\n  \"auth_token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3Nzc0ODE4NzYsImlhdCI6MTc3NzQ4MTgxNiwic3ViIjoidHJhY2VyIn0.pleiyPXh6JpFxG4iMsAu5a6E4PuS5YPxGNPSSwCQUqE\",\n  \"message\": \"Successfully logged in.\",\n  \"status\": \"success\"\n}"
+    }
+  }
+}
+```
 ## Roadmap
 
 Next production-grade steps:

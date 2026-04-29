@@ -20,7 +20,31 @@ The following capabilities have been validated and serve as the foundation for a
 - HTTP reassembly
 - Structured JSON output
 
-**Remaining risk:** The current implementation proves feasibility, not production readiness.
+**Remaining risk:** The original baseline proved feasibility, not production readiness.
+
+### Current Implementation Status — 2026-04-29
+
+The first implementation pass for Milestones 1–3 has been started and validated against VAmPI container capture.
+
+Validated in the current branch:
+
+- Container target mode can discover and trace the VAmPI serving process without manually selecting the Flask child PID.
+- Agent captures syscall traffic from the target container and publishes to Kafka.
+- Worker reconstructs complete HTTP/1.x conversations and emits complete endpoint JSON.
+- Normalized non-redundant JSON output is now available by default through `-output-contract normalized`.
+- Legacy/Karaxys-compatible output remains available through `-output-contract legacy`.
+- Flow-level filtering now preserves request headers, request bodies, response headers, response bodies, and close events for a classified `(pid, fd, generation)` flow.
+- Process metadata and container ID are emitted in normalized output.
+- Explicit loss/truncation fields exist in the raw and normalized event contracts.
+- Bounded in-agent queue, backpressure modes, health, readiness, and metrics endpoints have been introduced.
+
+Known gaps still requiring hardening:
+
+- Connection metadata is still not consistently populated in normalized output and requires validation/fix of socket lifecycle metadata capture.
+- True BPF-side multi-chunk payload emission is not complete; current implementation exposes truncation/loss rather than guaranteeing full large-body reconstruction.
+- Validation is currently strongest on VAmPI; Juice Shop, crAPI, httpbin/nginx, Go HTTP, and FastAPI/Gunicorn validation are still pending.
+- Disk spool/WAL, Kafka circuit breaker behavior, and load-tested throughput targets are not complete.
+- Kubernetes/container-runtime production metadata is not complete.
 
 ---
 
@@ -64,12 +88,13 @@ The existing `target_pids` BPF map remains the mechanism. The Go agent owns targ
 
 ### Acceptance Criteria
 
-- [ ] Captures VAmPI without manually identifying the Flask child PID.
+- [x] Captures VAmPI without manually identifying the Flask child PID.
 - [ ] Captures Juice Shop by container name.
 - [ ] Captures crAPI service containers by container ID or name.
-- [ ] Captures child processes spawned after tracer startup.
-- [ ] Logs active traced PIDs and removes entries for terminated processes.
-- [ ] Application availability is unaffected if the tracer starts, stops, or crashes.
+- [x] Captures existing child processes via container PID discovery.
+- [x] Logs active traced PIDs and removes entries for terminated processes during target refresh.
+- [x] Application availability is unaffected if the tracer starts, stops, or crashes in VAmPI validation.
+- [ ] Validate child processes spawned after tracer startup across Gunicorn/Node/FastAPI targets.
 
 ---
 
@@ -137,13 +162,15 @@ Every emitted conversation must include:
 
 ### Acceptance Criteria
 
-- [ ] stdout, stderr, and file I/O noise is excluded by default.
-- [ ] Internal infrastructure ports (Kafka, Mongo, Redis, Postgres, MySQL) are ignorable via config.
+- [x] stdout, stderr, and file I/O noise is excluded by default for the validated VAmPI flow.
+- [x] Internal infrastructure ports (Kafka, Mongo, Redis) are ignorable via config.
 - [ ] Juice Shop, crAPI, and VAmPI all produce clean HTTP conversations without per-app code changes.
-- [ ] Filtered and skipped event counts are surfaced in metrics or logs.
-- [ ] Existing downstream field shape is not broken; new metadata is additive.
-- [ ] Raw event and normalized conversation schemas are documented.
-- [ ] Worker tests validate schema output.
+- [x] Filtered and skipped event counts are surfaced in metrics or logs.
+- [x] Existing downstream field shape is not broken; legacy mode remains available.
+- [x] Normalized non-redundant conversation schema is implemented.
+- [x] Worker tests validate schema output.
+- [ ] Raw event and normalized conversation schemas need formal README/API documentation.
+- [ ] Connection metadata must be consistently populated and validated for short-lived and keep-alive sockets.
 
 ---
 
@@ -174,8 +201,9 @@ Eliminate the 4096-byte payload ceiling and introduce explicit truncation and lo
 
 - [ ] A request body larger than 4096 bytes is fully reconstructed.
 - [ ] A response body larger than 4096 bytes is fully reconstructed.
+- [x] Events can carry original size vs captured size and loss metadata.
 - [ ] Bodies exceeding the configured maximum are explicitly flagged as policy-truncated in output.
-- [ ] Ring buffer drops, Kafka queue drops, worker stream overflows, and parser gaps are all visible in metrics or logs.
+- [x] Ring buffer drops, Kafka queue drops, worker stream overflows, and parser gaps are surfaced in metrics or logs.
 - [ ] No silent truncation or silent drop paths remain.
 
 ---
@@ -274,9 +302,13 @@ Define and implement a deliberate, explicit failure policy for Kafka unavailabil
 ### Acceptance Criteria
 
 - [ ] Kafka outage does not cause silent event loss.
-- [ ] All drop events are counted and surfaced in metrics.
+- [x] Bounded local in-memory queue exists.
+- [x] Backpressure modes exist: `best-effort`, `strict`, `drop-newest`, `drop-oldest`.
+- [x] Queue/drop events are counted and surfaced in metrics.
+- [ ] Disk spool/WAL for production mode is implemented.
 - [ ] Circuit breaker recovers automatically when Kafka becomes available.
-- [ ] Health and readiness endpoints return accurate status.
+- [x] Health and readiness endpoints exist.
+- [ ] Health and readiness endpoints need production-grade degraded-state validation.
 
 ---
 
@@ -691,20 +723,107 @@ For each target, validate:
 
 # Immediate Next Sprint Checklist
 
-**Sprint 1: Generic Production Capture Foundation**
+## Current Completion Summary
 
-Must-have deliverables:
+Completed or substantially implemented:
 
-- [ ] `--pid`, `--pid-tree`, `--container`, `--all-pids` modes
-- [ ] Default socket FD filtering
-- [ ] Target and ignored port controls
-- [ ] Process and container metadata on events
-- [ ] Source and destination connection metadata on events
-- [ ] Normalized schema v1
-- [ ] Explicit truncation and loss fields
-- [ ] Validation against VAmPI, Juice Shop, and crAPI
+- [x] `--pid`, `--pid-tree`, `--container`, `--all-pids` modes
+- [x] Default flow/socket filtering path
+- [x] Target and ignored port controls
+- [x] Process and container ID metadata on events
+- [x] Normalized schema v1
+- [x] Non-redundant `-output-contract normalized` JSON output
+- [x] Legacy compatibility via `-output-contract legacy`
+- [x] Explicit truncation and loss fields
+- [x] Bounded local queue and basic backpressure modes
+- [x] `/healthz`, `/readyz`, and `/metrics`
+- [x] VAmPI container validation for complete HTTP JSON output
 
-Explicitly out of scope for this sprint:
+Not yet complete:
+
+- [ ] Reliable source/destination connection metadata in normalized output
+- [ ] True BPF-side multi-chunk large-payload capture
+- [ ] Juice Shop validation
+- [ ] crAPI validation
+- [ ] Large body validation
+- [ ] Kafka outage/backpressure validation
+- [ ] Disk spool/WAL
+- [ ] Load and resilience benchmark harness
+
+## Next Sprint — Sprint 2A: Connection Metadata Hardening
+
+Objective: make `connection` metadata reliable for short-lived and keep-alive HTTP sockets.
+
+Deliverables:
+
+- [ ] Validate `accept`/`accept4` socket lifecycle events after BPF regeneration.
+- [ ] Ensure agent caches connection metadata by `(pid, fd, generation)` at socket creation time.
+- [ ] Populate normalized `connection.src_ip`, `connection.src_port`, `connection.dst_ip`, `connection.dst_port`, `protocol`, `family`, and `role`.
+- [ ] Add debug logs/metrics for socket metadata events, cache hits, and cache misses.
+- [ ] Add integration validation for VAmPI `Connection: close` and keep-alive requests.
+- [ ] Add fallback handling for client/outbound flows using `connect` lifecycle events.
+
+Acceptance Criteria:
+
+- [ ] VAmPI normalized output contains non-empty connection metadata.
+- [ ] Keep-alive requests retain correct connection metadata across multiple conversations.
+- [ ] Short-lived `Connection: close` sockets do not produce empty `connection` objects.
+
+## Next Sprint — Sprint 2B: Multi-Target Validation
+
+Objective: prove target-agnostic behavior beyond VAmPI.
+
+Deliverables:
+
+- [ ] Add reproducible validation commands for OWASP Juice Shop.
+- [ ] Add reproducible validation commands for crAPI.
+- [ ] Add validation target for nginx/httpbin.
+- [ ] Add validation target for FastAPI/Gunicorn process-tree behavior.
+- [ ] Capture examples for GET, POST, JSON request body, JSON response body, and error responses.
+
+Acceptance Criteria:
+
+- [ ] VAmPI, Juice Shop, and crAPI all emit complete normalized endpoint JSON without per-app code changes.
+- [ ] Container mode works for all validation targets.
+- [ ] PID-tree mode works for multiprocess targets.
+
+## Next Sprint — Sprint 3A: True Large Payload Completeness
+
+Objective: eliminate the current fixed single-event payload ceiling for normal configured body limits.
+
+Deliverables:
+
+- [ ] Implement verifier-safe BPF chunk emission for large `read`, `write`, `recvfrom`, and `sendto` buffers.
+- [ ] Improve `readv`/`writev` multi-segment capture beyond current segment cap where verifier-safe.
+- [ ] Preserve original syscall length, chunk index, chunk count, and sequence order.
+- [ ] Worker tests for request and response bodies larger than 4096 bytes.
+- [ ] Explicit policy truncation when configured max body/stream limits are exceeded.
+
+Acceptance Criteria:
+
+- [ ] Request bodies larger than 4096 bytes reconstruct completely under configured limits.
+- [ ] Response bodies larger than 4096 bytes reconstruct completely under configured limits.
+- [ ] Any truncation is explicit in `loss`, never silent.
+
+## Next Sprint — Sprint 3B: Resilience Validation and Disk Spool
+
+Objective: make downstream pressure behavior production-grade.
+
+Deliverables:
+
+- [ ] Kafka outage test plan and automated script.
+- [ ] Disk spool/WAL for production mode.
+- [ ] Kafka circuit breaker with recovery behavior.
+- [ ] Metrics for spool depth, spool bytes, replay count, and replay failures.
+- [ ] Load tests with small/high-RPS and large-body scenarios.
+
+Acceptance Criteria:
+
+- [ ] Kafka outage does not crash the agent or target application.
+- [ ] Event loss is explicit and counted if configured limits are exceeded.
+- [ ] Agent recovers and resumes publishing when Kafka returns.
+
+Explicitly still out of scope until the above are complete:
 
 - OpenSSL TLS capture
 - Go TLS capture

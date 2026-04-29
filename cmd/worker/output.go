@@ -30,25 +30,74 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 		path = parsedReq.req.URL.Path
 	}
 
-	conversation := HttpConversation{
-		ID:         OIDField{OID: newOID()},
-		CreatedAt:  DateField{Date: parsedReq.capturedAt.Format(time.RFC3339Nano)},
-		Method:     parsedReq.req.Method,
-		URL:        fmt.Sprintf("http://%s%s", host, path),
-		Host:       host,
-		Path:       path,
-		ReqHeaders: parsedReq.req.Header,
-		ReqBody:    prettyMaybeJSON(parsedReq.body),
-		RespStatus: resp.Status,
-		RespBody:   prettyMaybeJSON(respBody),
+	prettyReqBody := prettyMaybeJSON(parsedReq.body)
+	prettyRespBody := prettyMaybeJSON(respBody)
+	url := fmt.Sprintf("http://%s%s", host, path)
+	normalized := NormalizedConversation{
+		ID:            OIDField{OID: newOID()},
+		SchemaVersion: "http.conversation.v1",
+		CaptureSource: firstNonEmpty(parsedReq.captureSource, "ebpf"),
+		CaptureMode:   parsedReq.captureMode,
+		CapturedAt:    DateField{Date: parsedReq.capturedAt.Format(time.RFC3339Nano)},
+		Connection:    parsedReq.connection,
+		Process:       parsedReq.process,
+		Container:     parsedReq.container,
+		Loss:          parsedReq.loss,
+		HTTP: HTTPExchange{
+			Request: NormalizedHTTPRequest{
+				Method:  parsedReq.req.Method,
+				URL:     url,
+				Host:    host,
+				Path:    path,
+				Headers: parsedReq.req.Header,
+				Body:    prettyReqBody,
+			},
+			Response: NormalizedHTTPResponse{
+				Status:  resp.Status,
+				Headers: resp.Header,
+				Body:    prettyRespBody,
+			},
+		},
+	}
+
+	legacy := HttpConversation{
+		ID:            normalized.ID,
+		SchemaVersion: normalized.SchemaVersion,
+		CaptureSource: normalized.CaptureSource,
+		CaptureMode:   normalized.CaptureMode,
+		CreatedAt:     DateField{Date: parsedReq.capturedAt.Format(time.RFC3339Nano)},
+		Connection:    parsedReq.connection,
+		Process:       parsedReq.process,
+		Container:     parsedReq.container,
+		Loss:          parsedReq.loss,
+		Request:       HttpMessage{Headers: parsedReq.req.Header, Body: prettyReqBody},
+		Response:      HttpMessage{Headers: resp.Header, Body: prettyRespBody, Status: resp.Status},
+		Method:        parsedReq.req.Method,
+		URL:           url,
+		Host:          host,
+		Path:          path,
+		ReqHeaders:    parsedReq.req.Header,
+		ReqBody:       prettyReqBody,
+		RespStatus:    resp.Status,
+		RespBody:      prettyRespBody,
+	}
+
+	payload := any(normalized)
+	if cfg.outputContract == "legacy" {
+		payload = legacy
+	} else if cfg.outputContract == "both" {
+		payload = struct {
+			Normalized NormalizedConversation `json:"normalized"`
+			Legacy     HttpConversation       `json:"legacy"`
+		}{Normalized: normalized, Legacy: legacy}
 	}
 
 	var output []byte
 	var err error
 	if cfg.prettyOutput {
-		output, err = json.MarshalIndent(conversation, "", "  ")
+		output, err = json.MarshalIndent(payload, "", "  ")
 	} else {
-		output, err = json.Marshal(conversation)
+		output, err = json.Marshal(payload)
 	}
 
 	if err != nil {
@@ -56,7 +105,7 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 		return
 	}
 
-	title := fmt.Sprintf("%s %s -> %s", conversation.Method, conversation.Path, conversation.RespStatus)
+	title := fmt.Sprintf("%s %s -> %s", normalized.HTTP.Request.Method, normalized.HTTP.Request.Path, normalized.HTTP.Response.Status)
 	if cfg.prettyOutput {
 		bar := strings.Repeat("=", boundedLen(len(title)+20, 64, 120))
 		fmt.Fprintln(out, bar)
@@ -133,6 +182,15 @@ func logStats(prefix string, stats *workerStats) {
 		atomic.LoadUint64(&stats.kafkaErrors),
 		atomic.LoadUint64(&stats.expiredSessions),
 	)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func prettyMaybeJSON(body string) string {

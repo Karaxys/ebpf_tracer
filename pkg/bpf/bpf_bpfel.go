@@ -75,6 +75,8 @@ type bpfProgramSpecs struct {
 	TraceSysEnterSendto   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_sendto"`
 	TraceSysEnterWrite    *ebpf.ProgramSpec `ebpf:"trace_sys_enter_write"`
 	TraceSysEnterWritev   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_writev"`
+	TraceSysExitAccept    *ebpf.ProgramSpec `ebpf:"trace_sys_exit_accept"`
+	TraceSysExitAccept4   *ebpf.ProgramSpec `ebpf:"trace_sys_exit_accept4"`
 	TraceSysExitRead      *ebpf.ProgramSpec `ebpf:"trace_sys_exit_read"`
 	TraceSysExitReadv     *ebpf.ProgramSpec `ebpf:"trace_sys_exit_readv"`
 	TraceSysExitRecvfrom  *ebpf.ProgramSpec `ebpf:"trace_sys_exit_recvfrom"`
@@ -154,6 +156,8 @@ type bpfPrograms struct {
 	TraceSysEnterSendto   *ebpf.Program `ebpf:"trace_sys_enter_sendto"`
 	TraceSysEnterWrite    *ebpf.Program `ebpf:"trace_sys_enter_write"`
 	TraceSysEnterWritev   *ebpf.Program `ebpf:"trace_sys_enter_writev"`
+	TraceSysExitAccept    *ebpf.Program `ebpf:"trace_sys_exit_accept"`
+	TraceSysExitAccept4   *ebpf.Program `ebpf:"trace_sys_exit_accept4"`
 	TraceSysExitRead      *ebpf.Program `ebpf:"trace_sys_exit_read"`
 	TraceSysExitReadv     *ebpf.Program `ebpf:"trace_sys_exit_readv"`
 	TraceSysExitRecvfrom  *ebpf.Program `ebpf:"trace_sys_exit_recvfrom"`
@@ -168,6 +172,8 @@ func (p *bpfPrograms) Close() error {
 		p.TraceSysEnterSendto,
 		p.TraceSysEnterWrite,
 		p.TraceSysEnterWritev,
+		p.TraceSysExitAccept,
+		p.TraceSysExitAccept4,
 		p.TraceSysExitRead,
 		p.TraceSysExitReadv,
 		p.TraceSysExitRecvfrom,
