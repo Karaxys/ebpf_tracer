@@ -88,6 +88,34 @@ Run tests:
 go test ./...
 ```
 
+## One-Command Local VAmPI Capture
+
+For local validation, this repo includes a wrapper that starts Kafka, starts the
+VAmPI test target, builds the agent/worker, launches the worker, and runs the
+agent against the VAmPI container:
+
+```bash
+make local-vampi
+```
+
+To send normalized conversations into Karaxys backend ingestion:
+
+```bash
+KARAXYS_BACKEND_URL=http://127.0.0.1:8081 \
+KARAXYS_AGENT_TOKEN=dev-agent-token \
+make local-vampi
+```
+
+In another terminal, generate sample traffic:
+
+```bash
+make smoke-traffic
+```
+
+The agent requires Linux eBPF privileges and will invoke `sudo` for the agent
+process. Worker logs are written to `logs/worker.log`; failed sink deliveries
+are written to `logs/worker-deadletters.jsonl` when backend ingestion is enabled.
+
 ## End-To-End Workflow With VAmPI
 
 ### 1. Start Kafka

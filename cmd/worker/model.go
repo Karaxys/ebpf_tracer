@@ -16,6 +16,11 @@ const (
 	defaultStatsInterval  = 10 * time.Second
 	defaultMaxBodyBytes   = 1024 * 1024
 	defaultMaxStreamBytes = 8 * 1024 * 1024
+	defaultOutputSink     = outputSinkStdout
+	defaultOutputTopic    = "karaxys.http.conversations"
+	defaultHTTPTimeout    = 10 * time.Second
+	defaultHTTPMaxRetries = 3
+	defaultHTTPRetryDelay = 500 * time.Millisecond
 
 	requestStartProbeWindow  = 16
 	responseStartProbeWindow = 16
@@ -25,6 +30,10 @@ const (
 
 	directionRead  = 0
 	directionWrite = 1
+
+	outputSinkStdout = "stdout"
+	outputSinkHTTP   = "http"
+	outputSinkKafka  = "kafka"
 )
 
 type config struct {
@@ -40,6 +49,17 @@ type config struct {
 	debugPayload     bool
 	outputContract   string
 	output           io.Writer
+	outputSink       string
+	backendURL       string
+	agentToken       string
+	agentID          string
+	httpTimeout      time.Duration
+	httpMaxRetries   int
+	httpRetryDelay   time.Duration
+	deadLetterFile   string
+	outputTopic      string
+	outputBootstrap  string
+	sink             conversationSink
 }
 
 type workerStats struct {
@@ -156,6 +176,7 @@ type HttpMessage struct {
 type NormalizedConversation struct {
 	ID            OIDField           `json:"_id"`
 	SchemaVersion string             `json:"schema_version"`
+	AgentID       string             `json:"agent_id,omitempty"`
 	CaptureSource string             `json:"capture_source"`
 	CaptureMode   string             `json:"capture_mode,omitempty"`
 	CapturedAt    DateField          `json:"captured_at"`
@@ -181,9 +202,10 @@ type NormalizedHTTPRequest struct {
 }
 
 type NormalizedHTTPResponse struct {
-	Status  string      `json:"status"`
-	Headers http.Header `json:"headers,omitempty"`
-	Body    string      `json:"body,omitempty"`
+	Status     string      `json:"status"`
+	StatusCode *int        `json:"status_code,omitempty"`
+	Headers    http.Header `json:"headers,omitempty"`
+	Body       string      `json:"body,omitempty"`
 }
 
 type HttpConversation struct {

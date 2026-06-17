@@ -13,6 +13,14 @@ import (
 
 func main() {
 	cfg := parseConfig()
+	sink, err := newConversationSink(cfg)
+	if err != nil {
+		log.Fatalf("Failed to create output sink: %s", err)
+	}
+	if sink != nil {
+		cfg.sink = sink
+		defer sink.Close()
+	}
 
 	consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers": cfg.bootstrapServers,
@@ -28,7 +36,7 @@ func main() {
 		log.Fatalf("Failed to subscribe: %s", err)
 	}
 
-	log.Printf("Worker started. topic=%s group=%s bootstrap=%s", cfg.topic, cfg.groupID, cfg.bootstrapServers)
+	log.Printf("Worker started. topic=%s group=%s bootstrap=%s output_sink=%s", cfg.topic, cfg.groupID, cfg.bootstrapServers, cfg.outputSink)
 
 	store := newSessionStore(cfg.sessionTTL)
 	stats := &workerStats{}

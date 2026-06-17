@@ -33,9 +33,11 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 	prettyReqBody := prettyMaybeJSON(parsedReq.body)
 	prettyRespBody := prettyMaybeJSON(respBody)
 	url := fmt.Sprintf("http://%s%s", host, path)
+	statusCode := resp.StatusCode
 	normalized := NormalizedConversation{
 		ID:            OIDField{OID: newOID()},
 		SchemaVersion: "http.conversation.v1",
+		AgentID:       cfg.agentID,
 		CaptureSource: firstNonEmpty(parsedReq.captureSource, "ebpf"),
 		CaptureMode:   parsedReq.captureMode,
 		CapturedAt:    DateField{Date: parsedReq.capturedAt.Format(time.RFC3339Nano)},
@@ -53,9 +55,10 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 				Body:    prettyReqBody,
 			},
 			Response: NormalizedHTTPResponse{
-				Status:  resp.Status,
-				Headers: resp.Header,
-				Body:    prettyRespBody,
+				Status:     resp.Status,
+				StatusCode: &statusCode,
+				Headers:    resp.Header,
+				Body:       prettyRespBody,
 			},
 		},
 	}
@@ -94,7 +97,9 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 
 	var output []byte
 	var err error
-	if cfg.prettyOutput {
+	if cfg.sink != nil {
+		output, err = json.Marshal(payload)
+	} else if cfg.prettyOutput {
 		output, err = json.MarshalIndent(payload, "", "  ")
 	} else {
 		output, err = json.Marshal(payload)
@@ -102,6 +107,13 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 
 	if err != nil {
 		log.Printf("Failed to marshal conversation: %v", err)
+		return
+	}
+
+	if cfg.sink != nil {
+		if err := cfg.sink.Emit(output); err != nil {
+			log.Printf("Failed to emit conversation to %s sink: %v", cfg.outputSink, err)
+		}
 		return
 	}
 

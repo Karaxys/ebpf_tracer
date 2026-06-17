@@ -3,10 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParseOneRequestComplete(t *testing.T) {
@@ -272,6 +277,145 @@ func TestProcessEventEmitsCleanNormalizedContract(t *testing.T) {
 	}
 	if normalized.HTTP.Response.Status != "200 OK" || normalized.HTTP.Response.Body != "{}" {
 		t.Fatalf("unexpected normalized response: %+v", normalized.HTTP.Response)
+	}
+}
+
+func TestProcessEventHTTPSinkPostsNormalizedConversation(t *testing.T) {
+	var received []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		if r.URL.Path != "/v1/ingest/conversations" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer agent-token" {
+			t.Errorf("missing bearer token")
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("unexpected content type: %s", r.Header.Get("Content-Type"))
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		received = body
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	cfg := testConfig(&bytes.Buffer{})
+	cfg.outputSink = outputSinkHTTP
+	cfg.outputContract = "normalized"
+	cfg.backendURL = server.URL
+	cfg.agentToken = "agent-token"
+	cfg.agentID = "agent-linux-01"
+	cfg.httpTimeout = time.Second
+	cfg.httpMaxRetries = 0
+	sink, err := newConversationSink(cfg)
+	if err != nil {
+		t.Fatalf("create sink: %v", err)
+	}
+	cfg.sink = sink
+	defer sink.Close()
+
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+	processEvent(store, cfg, stats, testEvent(1, directionRead, []byte("GET /api HTTP/1.1\r\nHost: juice.local\r\n\r\n")))
+	processEvent(store, cfg, stats, testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}")))
+
+	if len(received) == 0 {
+		t.Fatal("expected backend to receive conversation")
+	}
+	var normalized NormalizedConversation
+	if err := json.Unmarshal(received, &normalized); err != nil {
+		t.Fatalf("decode posted conversation: %v\nraw=%s", err, string(received))
+	}
+	if normalized.AgentID != "agent-linux-01" || normalized.CaptureSource != "ebpf" {
+		t.Fatalf("unexpected metadata: %+v", normalized)
+	}
+	if normalized.HTTP.Response.StatusCode == nil || *normalized.HTTP.Response.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %+v", normalized.HTTP.Response.StatusCode)
+	}
+}
+
+func TestHTTPSinkRetriesBackendFailures(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			http.Error(w, "temporary failure", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	deadLetter := filepath.Join(t.TempDir(), "deadletters.jsonl")
+	sink, err := newConversationSink(config{
+		outputSink:      outputSinkHTTP,
+		backendURL:      server.URL,
+		agentToken:      "agent-token",
+		httpTimeout:     time.Second,
+		httpMaxRetries:  1,
+		httpRetryDelay:  time.Millisecond,
+		deadLetterFile:  deadLetter,
+		outputContract:  "normalized",
+		outputBootstrap: defaultBootstrap,
+	})
+	if err != nil {
+		t.Fatalf("create sink: %v", err)
+	}
+	defer sink.Close()
+
+	if err := sink.Emit([]byte(`{"schema_version":"http.conversation.v1"}`)); err != nil {
+		t.Fatalf("expected retry to recover: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("unexpected attempts: %d", got)
+	}
+	if _, err := os.Stat(deadLetter); !os.IsNotExist(err) {
+		t.Fatalf("expected no dead-letter file, stat err=%v", err)
+	}
+}
+
+func TestHTTPSinkWritesDeadLetterAfterFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	deadLetter := filepath.Join(t.TempDir(), "deadletters.jsonl")
+	sink, err := newConversationSink(config{
+		outputSink:      outputSinkHTTP,
+		backendURL:      server.URL,
+		agentToken:      "agent-token",
+		httpTimeout:     time.Second,
+		httpMaxRetries:  0,
+		httpRetryDelay:  time.Millisecond,
+		deadLetterFile:  deadLetter,
+		outputContract:  "normalized",
+		outputBootstrap: defaultBootstrap,
+	})
+	if err != nil {
+		t.Fatalf("create sink: %v", err)
+	}
+	defer sink.Close()
+
+	payload := []byte(`{"schema_version":"http.conversation.v1"}`)
+	if err := sink.Emit(payload); err == nil {
+		t.Fatal("expected sink emit failure")
+	}
+
+	raw, err := os.ReadFile(deadLetter)
+	if err != nil {
+		t.Fatalf("read dead letter: %v", err)
+	}
+	var record sinkDeadLetter
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &record); err != nil {
+		t.Fatalf("decode dead letter: %v\nraw=%s", err, string(raw))
+	}
+	if record.Sink != outputSinkHTTP || !bytes.Equal(record.Payload, payload) {
+		t.Fatalf("unexpected dead letter: %+v", record)
 	}
 }
 
