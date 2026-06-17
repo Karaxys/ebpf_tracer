@@ -743,9 +743,9 @@ Not yet complete:
 
 - [ ] Reliable source/destination connection metadata in normalized output
 - [ ] True BPF-side multi-chunk large-payload capture
-- [ ] Juice Shop validation
-- [ ] crAPI validation
-- [ ] Large body validation
+- [x] Juice Shop validation
+- [x] crAPI validation
+- [x] Large body validation
 - [ ] Kafka outage/backpressure validation
 - [ ] Disk spool/WAL
 - [ ] Load and resilience benchmark harness

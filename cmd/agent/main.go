@@ -622,7 +622,7 @@ loop:
 		}
 
 		event := ApiEvent{
-			SchemaVersion: "raw.v1",
+			SchemaVersion: "raw.network.v1",
 			CaptureSource: "ebpf",
 			CaptureMode:   string(mode),
 			Timestamp:     bpfEvent.Timestamp,
