@@ -65,3 +65,4 @@ standalone_ebpf_tracer_plan.md
 
 # Host/kernel generated headers
 bpf/headers/vmlinux.h
+logs/
