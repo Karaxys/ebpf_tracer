@@ -11,6 +11,7 @@ VAMPI_IMAGE="${VAMPI_IMAGE:-erev0s/vampi:latest}"
 VAMPI_HOST_PORT="${VAMPI_HOST_PORT:-3000}"
 VAMPI_CONTAINER_PORT="${VAMPI_CONTAINER_PORT:-5000}"
 AGENT_ID="${KARAXYS_AGENT_ID:-local-ebpf-agent}"
+AGENT_NAME="${KARAXYS_AGENT_NAME:-${AGENT_ID}}"
 WORKER_GROUP_ID="${WORKER_GROUP_ID:-karaxys-worker-$(date +%s)}"
 
 mkdir -p "${BIN_DIR}" "${LOG_DIR}"
@@ -66,6 +67,29 @@ WORKER_ARGS=(
   -agent-id "${AGENT_ID}"
 )
 
+if [[ -n "${KARAXYS_BACKEND_URL:-}" && -z "${KARAXYS_AGENT_TOKEN:-}" && -n "${KARAXYS_ENROLLMENT_TOKEN:-}" ]]; then
+  echo "[karaxys] registering agent with backend enrollment token"
+  REGISTER_BODY="{\"enrollment_token\":\"${KARAXYS_ENROLLMENT_TOKEN}\",\"agent_name\":\"${AGENT_NAME}\"}"
+  REGISTER_RESPONSE="$(curl -fsS -X POST "${KARAXYS_BACKEND_URL%/}/agents/register" \
+    -H "Content-Type: application/json" \
+    -d "${REGISTER_BODY}")"
+  KARAXYS_AGENT_TOKEN="$(printf '%s' "${REGISTER_RESPONSE}" | sed -n 's/.*"agent_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  REGISTERED_AGENT_ID="$(printf '%s' "${REGISTER_RESPONSE}" | sed -n 's/.*"agent_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [[ -z "${KARAXYS_AGENT_TOKEN}" || -z "${REGISTERED_AGENT_ID}" ]]; then
+    echo "[karaxys] failed to parse agent registration response: ${REGISTER_RESPONSE}" >&2
+    exit 1
+  fi
+  AGENT_ID="${REGISTERED_AGENT_ID}"
+  WORKER_ARGS=(
+    -kafka-bootstrap "${KAFKA_BOOTSTRAP}"
+    -topic "${KAFKA_TOPIC}"
+    -group-id "${WORKER_GROUP_ID}"
+    -offset-reset earliest
+    -output-contract normalized
+    -agent-id "${AGENT_ID}"
+  )
+fi
+
 if [[ -n "${KARAXYS_BACKEND_URL:-}" && -n "${KARAXYS_AGENT_TOKEN:-}" ]]; then
   echo "[karaxys] worker sink: backend ${KARAXYS_BACKEND_URL}"
   WORKER_ARGS+=(
@@ -76,7 +100,7 @@ if [[ -n "${KARAXYS_BACKEND_URL:-}" && -n "${KARAXYS_AGENT_TOKEN:-}" ]]; then
     -pretty=false
   )
 else
-  echo "[karaxys] worker sink: stdout. Set KARAXYS_BACKEND_URL and KARAXYS_AGENT_TOKEN to ingest into backend."
+  echo "[karaxys] worker sink: stdout. Set KARAXYS_BACKEND_URL with KARAXYS_AGENT_TOKEN or KARAXYS_ENROLLMENT_TOKEN to ingest into backend."
   WORKER_ARGS+=(-output-sink stdout -pretty=true)
 fi
 

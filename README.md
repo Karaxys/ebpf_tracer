@@ -102,9 +102,14 @@ To send normalized conversations into Karaxys backend ingestion:
 
 ```bash
 KARAXYS_BACKEND_URL=http://127.0.0.1:8081 \
-KARAXYS_AGENT_TOKEN=dev-agent-token \
+KARAXYS_ENROLLMENT_TOKEN=<enrollment-token-from-backend> \
 make local-vampi
 ```
+
+The script registers the agent through `POST /agents/register`, receives a
+per-agent token, and uses that token for `POST /v1/ingest/conversations`.
+`KARAXYS_AGENT_TOKEN` is still accepted as a local compatibility fallback, but
+the production flow should use enrollment tokens and per-agent credentials.
 
 In another terminal, generate sample traffic:
 
