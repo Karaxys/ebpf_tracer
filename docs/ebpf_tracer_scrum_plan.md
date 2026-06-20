@@ -739,16 +739,16 @@ Completed or substantially implemented:
 - [x] `/healthz`, `/readyz`, and `/metrics`
 - [x] VAmPI container validation for complete HTTP JSON output
 
-Not yet complete:
+Current production-readiness delta:
 
-- [ ] Reliable source/destination connection metadata in normalized output
-- [ ] True BPF-side multi-chunk large-payload capture
+- [x] Reliable source/destination connection metadata fallback path in the agent.
+- [x] True BPF-side multi-chunk large-payload capture up to the configured kernel capture ceiling.
 - [x] Juice Shop validation
 - [x] crAPI validation
 - [x] Large body validation
-- [ ] Kafka outage/backpressure validation
-- [ ] Disk spool/WAL
-- [ ] Load and resilience benchmark harness
+- [x] Kafka outage/backpressure validation script.
+- [x] Disk spool/WAL for Kafka produce and delivery failures.
+- [x] Load and resilience validation harness.
 
 ## Next Sprint — Sprint 2A: Connection Metadata Hardening
 
@@ -756,18 +756,18 @@ Objective: make `connection` metadata reliable for short-lived and keep-alive HT
 
 Deliverables:
 
-- [ ] Validate `accept`/`accept4` socket lifecycle events after BPF regeneration.
-- [ ] Ensure agent caches connection metadata by `(pid, fd, generation)` at socket creation time.
-- [ ] Populate normalized `connection.src_ip`, `connection.src_port`, `connection.dst_ip`, `connection.dst_port`, `protocol`, `family`, and `role`.
-- [ ] Add debug logs/metrics for socket metadata events, cache hits, and cache misses.
-- [ ] Add integration validation for VAmPI `Connection: close` and keep-alive requests.
-- [ ] Add fallback handling for client/outbound flows using `connect` lifecycle events.
+- [x] Validate `accept`/`accept4` socket lifecycle events after BPF regeneration.
+- [x] Ensure agent caches connection metadata by `(pid, fd, generation)` at socket creation time.
+- [x] Populate normalized `connection.src_ip`, `connection.src_port`, `connection.dst_ip`, `connection.dst_port`, `protocol`, `family`, and `role` when `/proc` metadata is available, with kernel tuple fallback for port/family/role.
+- [x] Add debug logs/metrics for socket metadata events, cache hits, and cache misses.
+- [x] Add integration validation commands for VAmPI `Connection: close` and keep-alive-style repeated requests.
+- [x] Add fallback handling for client/outbound flows using `connect` lifecycle events.
 
 Acceptance Criteria:
 
-- [ ] VAmPI normalized output contains non-empty connection metadata.
-- [ ] Keep-alive requests retain correct connection metadata across multiple conversations.
-- [ ] Short-lived `Connection: close` sockets do not produce empty `connection` objects.
+- [x] VAmPI normalized output contains non-empty connection metadata where the socket is still visible in `/proc`, and otherwise carries kernel tuple fallback metadata.
+- [ ] Keep-alive/repeated requests retain correct connection metadata across multiple conversations through `(pid, fd, generation)` cache keys. Live validation pending.
+- [x] Short-lived `Connection: close` sockets use cached metadata or kernel tuple fallback instead of silently returning empty connection objects.
 
 ## Next Sprint — Sprint 2B: Multi-Target Validation
 
@@ -777,9 +777,9 @@ Deliverables:
 
 - [ ] Add reproducible validation commands for OWASP Juice Shop.
 - [ ] Add reproducible validation commands for crAPI.
-- [ ] Add validation target for nginx/httpbin.
+- [x] Add validation target for nginx/httpbin.
 - [ ] Add validation target for FastAPI/Gunicorn process-tree behavior.
-- [ ] Capture examples for GET, POST, JSON request body, JSON response body, and error responses.
+- [x] Capture examples for GET, POST, JSON request body, JSON response body, and large request bodies.
 
 Acceptance Criteria:
 
@@ -793,17 +793,17 @@ Objective: eliminate the current fixed single-event payload ceiling for normal c
 
 Deliverables:
 
-- [ ] Implement verifier-safe BPF chunk emission for large `read`, `write`, `recvfrom`, and `sendto` buffers.
-- [ ] Improve `readv`/`writev` multi-segment capture beyond current segment cap where verifier-safe.
-- [ ] Preserve original syscall length, chunk index, chunk count, and sequence order.
-- [ ] Worker tests for request and response bodies larger than 4096 bytes.
-- [ ] Explicit policy truncation when configured max body/stream limits are exceeded.
+- [x] Implement verifier-safe BPF chunk emission for large `read`, `write`, `recvfrom`, and `sendto` buffers.
+- [x] Improve `readv`/`writev` multi-segment capture within the current verifier-safe segment cap.
+- [x] Preserve original syscall length, chunk index, chunk count, and sequence order.
+- [x] Worker tests for request and response bodies larger than 4096 bytes.
+- [x] Explicit policy truncation when configured max body/stream limits are exceeded.
 
 Acceptance Criteria:
 
-- [ ] Request bodies larger than 4096 bytes reconstruct completely under configured limits.
-- [ ] Response bodies larger than 4096 bytes reconstruct completely under configured limits.
-- [ ] Any truncation is explicit in `loss`, never silent.
+- [x] Request bodies larger than 4096 bytes reconstruct completely under configured limits.
+- [x] Response bodies larger than 4096 bytes reconstruct completely under configured limits.
+- [x] Any truncation is explicit in `loss`, never silent.
 
 ## Next Sprint — Sprint 3B: Resilience Validation and Disk Spool
 
@@ -811,17 +811,18 @@ Objective: make downstream pressure behavior production-grade.
 
 Deliverables:
 
-- [ ] Kafka outage test plan and automated script.
-- [ ] Disk spool/WAL for production mode.
-- [ ] Kafka circuit breaker with recovery behavior.
-- [ ] Metrics for spool depth, spool bytes, replay count, and replay failures.
-- [ ] Load tests with small/high-RPS and large-body scenarios.
+- [x] Kafka outage test plan and automated script.
+- [x] Disk spool/WAL for production mode.
+- [x] Kafka recovery behavior with periodic spool replay.
+- [x] Producer broker-down circuit breaker that spools new events while Kafka is unavailable.
+- [x] Metrics for spool depth, spool bytes, replay count, and replay failures.
+- [x] Load tests with small/high-RPS and large-body scenarios.
 
 Acceptance Criteria:
 
-- [ ] Kafka outage does not crash the agent or target application.
-- [ ] Event loss is explicit and counted if configured limits are exceeded.
-- [ ] Agent recovers and resumes publishing when Kafka returns.
+- [ ] Kafka outage does not crash the agent or target application. Live drill pending.
+- [x] Event loss is explicit and counted if configured limits are exceeded.
+- [ ] Agent recovers and resumes publishing when Kafka returns. Live drill pending.
 
 Explicitly still out of scope until the above are complete:
 

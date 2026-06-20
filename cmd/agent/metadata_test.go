@@ -41,6 +41,44 @@ func TestMetadataResolverCacheUsesFDGeneration(t *testing.T) {
 	}
 }
 
+func TestMetadataResolverDoesNotReturnStaleNegativeConnectionCache(t *testing.T) {
+	resolver := newMetadataResolver(time.Minute)
+	key := flowKey{pid: 999999, fd: 7, generation: 1}
+	resolver.cache[key] = metadataCacheEntry{
+		conn:      connectionMetadata{SrcPort: 5000, Protocol: "tcp"},
+		ok:        false,
+		checkedAt: time.Now(),
+	}
+
+	conn, _, _, ok, source := resolver.resolveWithSource(key.pid, key.fd, key.generation)
+	if ok {
+		t.Fatalf("expected unresolved connection for impossible pid")
+	}
+	if source != metadataSourceNone {
+		t.Fatalf("source = %s, want none", source)
+	}
+	if conn.SrcPort == 5000 || conn.Protocol == "tcp" {
+		t.Fatalf("returned stale negative-cache connection: %+v", conn)
+	}
+}
+
+func TestMetadataResolverRememberCachesResolvedConnection(t *testing.T) {
+	resolver := newMetadataResolver(time.Minute)
+	conn := connectionMetadata{SrcPort: 5000, DstPort: 51000, Protocol: "tcp", Family: "ipv4", Role: "inbound"}
+	proc := processMetadata{PID: 100, Name: "python"}
+	container := containerMetadata{ID: "abc123", Runtime: "docker"}
+
+	resolver.remember(100, 5, 2, conn, proc, container)
+
+	gotConn, gotProc, gotContainer, ok, source := resolver.resolveWithSource(100, 5, 2)
+	if !ok || source != metadataSourceCache {
+		t.Fatalf("expected cached metadata, ok=%t source=%s", ok, source)
+	}
+	if gotConn != conn || gotProc != proc || gotContainer != container {
+		t.Fatalf("unexpected cached values: conn=%+v proc=%+v container=%+v", gotConn, gotProc, gotContainer)
+	}
+}
+
 func TestExtractContainerIdentityDockerSystemdCgroup(t *testing.T) {
 	containerID := "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
 	cgroup := "0::/system.slice/docker-" + containerID + ".scope"

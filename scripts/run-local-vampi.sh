@@ -7,6 +7,8 @@ LOG_DIR="${ROOT_DIR}/logs"
 KAFKA_BOOTSTRAP="${KAFKA_BOOTSTRAP:-localhost:9092}"
 KAFKA_TOPIC="${KAFKA_TOPIC:-raw-network-traffic}"
 KAFKA_METRICS_TOPIC="${KAFKA_METRICS_TOPIC:-karaxys.agent.metrics}"
+KAFKA_MESSAGE_TIMEOUT_MS="${KAFKA_MESSAGE_TIMEOUT_MS:-30000}"
+KAFKA_CIRCUIT_BREAKER_DURATION="${KAFKA_CIRCUIT_BREAKER_DURATION:-15s}"
 VAMPI_CONTAINER="${VAMPI_CONTAINER:-vampi-test}"
 VAMPI_IMAGE="${VAMPI_IMAGE:-erev0s/vampi:latest}"
 VAMPI_HOST_PORT="${VAMPI_HOST_PORT:-3000}"
@@ -147,6 +149,8 @@ AGENT_ARGS=(
   -kafka-bootstrap "${KAFKA_BOOTSTRAP}" \
   -topic "${KAFKA_TOPIC}" \
   -metrics-topic "${KAFKA_METRICS_TOPIC}" \
+  -kafka-message-timeout-ms "${KAFKA_MESSAGE_TIMEOUT_MS}" \
+  -kafka-circuit-breaker-duration "${KAFKA_CIRCUIT_BREAKER_DURATION}" \
   -target-ports "${VAMPI_CONTAINER_PORT}" \
   -stats-interval 5s \
   -spool-file "${LOG_DIR}/agent-spool.jsonl"

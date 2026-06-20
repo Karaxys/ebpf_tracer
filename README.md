@@ -166,6 +166,12 @@ curl -s "http://127.0.0.1:8081/inventory?limit=50" \
   -H "Authorization: Bearer $ACCESS_TOKEN" | jq
 ```
 
+Validate the latest worker stats:
+
+```bash
+make validate-worker-log
+```
+
 The agent requires Linux eBPF privileges and will invoke `sudo` for the agent
 process. Worker logs are written to `logs/worker.log`; failed sink deliveries
 are written to `logs/worker-deadletters.jsonl` when backend ingestion is enabled.
@@ -176,6 +182,143 @@ agent, rebuild by rerunning `make local-vampi`, use a fresh `KAFKA_TOPIC`, then
 send traffic again. Expected healthy counters after `make smoke-traffic` are
 `routedReq>0`, `reqParsed>0`, `parsed>0`, followed by backend
 `POST /v1/ingest/conversations | Status: 202` logs.
+
+## Additional eBPF Validation Targets
+
+The local runner is VAmPI-named for historical reasons, but it can run any
+single-container HTTP target by overriding the container/image/port variables.
+
+### httpbin
+
+Backend data source/enrollment for httpbin:
+
+```bash
+cd /home/shion/Documents/Karaxys/karaxys_backend
+KARAXYS_LOCAL_TARGET_URL=http://127.0.0.1:3001 \
+KARAXYS_LOCAL_TARGET_PORTS=80 \
+make local-bootstrap
+```
+
+Run the target through the tracer:
+
+```bash
+cd /home/shion/Documents/Karaxys/ebpf_tracer
+KAFKA_TOPIC="raw-network-traffic-$(date +%s)" \
+VAMPI_CONTAINER=httpbin-test \
+VAMPI_IMAGE=kennethreitz/httpbin \
+VAMPI_HOST_PORT=3001 \
+VAMPI_CONTAINER_PORT=80 \
+KARAXYS_BACKEND_URL=http://127.0.0.1:8081 \
+KARAXYS_ENROLLMENT_TOKEN="$(cat /tmp/karaxys_enrollment_token)" \
+make local-vampi
+```
+
+Generate httpbin traffic:
+
+```bash
+make smoke-httpbin
+make validate-worker-log
+```
+
+Fish shell:
+
+```fish
+cd /home/shion/Documents/Karaxys/karaxys_backend
+env KARAXYS_LOCAL_TARGET_URL=http://127.0.0.1:3001 KARAXYS_LOCAL_TARGET_PORTS=80 make local-bootstrap
+
+cd /home/shion/Documents/Karaxys/ebpf_tracer
+set -x KAFKA_TOPIC raw-network-traffic-(date +%s)
+set -x VAMPI_CONTAINER httpbin-test
+set -x VAMPI_IMAGE kennethreitz/httpbin
+set -x VAMPI_HOST_PORT 3001
+set -x VAMPI_CONTAINER_PORT 80
+set -x KARAXYS_BACKEND_URL http://127.0.0.1:8081
+set -x KARAXYS_ENROLLMENT_TOKEN (string trim (cat /tmp/karaxys_enrollment_token))
+make local-vampi
+```
+
+### OWASP Juice Shop
+
+Juice Shop works with the same local runner. Use host port `3002` to avoid
+colliding with the default VAmPI port, while keeping the container target port
+as `3000`.
+
+Backend data source/enrollment for Juice Shop:
+
+```bash
+cd /home/shion/Documents/Karaxys/karaxys_backend
+KARAXYS_LOCAL_DATA_SOURCE_NAME="Local Juice Shop eBPF" \
+KARAXYS_LOCAL_TARGET_URL=http://127.0.0.1:3002 \
+KARAXYS_LOCAL_TARGET_PORTS=3000 \
+make local-bootstrap
+```
+
+Run Juice Shop through the tracer:
+
+```bash
+cd /home/shion/Documents/Karaxys/ebpf_tracer
+KAFKA_TOPIC="raw-network-traffic-$(date +%s)" \
+VAMPI_CONTAINER=juice-shop-test \
+VAMPI_IMAGE=bkimminich/juice-shop \
+VAMPI_HOST_PORT=3002 \
+VAMPI_CONTAINER_PORT=3000 \
+KARAXYS_BACKEND_URL=http://127.0.0.1:8081 \
+KARAXYS_ENROLLMENT_TOKEN="$(cat /tmp/karaxys_enrollment_token)" \
+make local-vampi
+```
+
+Generate Juice Shop traffic:
+
+```bash
+make smoke-juice-shop
+make validate-worker-log
+```
+
+Fish shell:
+
+```fish
+cd /home/shion/Documents/Karaxys/karaxys_backend
+env KARAXYS_LOCAL_DATA_SOURCE_NAME="Local Juice Shop eBPF" KARAXYS_LOCAL_TARGET_URL=http://127.0.0.1:3002 KARAXYS_LOCAL_TARGET_PORTS=3000 make local-bootstrap
+
+cd /home/shion/Documents/Karaxys/ebpf_tracer
+set -x KAFKA_TOPIC raw-network-traffic-(date +%s)
+set -x VAMPI_CONTAINER juice-shop-test
+set -x VAMPI_IMAGE bkimminich/juice-shop
+set -x VAMPI_HOST_PORT 3002
+set -x VAMPI_CONTAINER_PORT 3000
+set -x KARAXYS_BACKEND_URL http://127.0.0.1:8081
+set -x KARAXYS_ENROLLMENT_TOKEN (string trim (cat /tmp/karaxys_enrollment_token))
+make local-vampi
+```
+
+### Load And Resilience
+
+Generate repeated traffic against the current target:
+
+```bash
+LOAD_REQUESTS=100 LOAD_CONCURRENCY=10 make load-traffic
+make validate-worker-log
+```
+
+Run the Kafka outage drill while `make local-vampi` is running in another
+terminal:
+
+```bash
+make kafka-outage-drill
+```
+
+The outage drill stops the local Kafka container, sends traffic, verifies that
+the agent enters broker-unavailable mode, verifies that new capture events are
+spooled through the producer circuit breaker, restarts Kafka, waits for periodic
+replay, and expects readiness to return with `spool_bytes=0`. This validates
+that Kafka outages are explicit, bounded, spooled, and retried after recovery.
+
+During the drill, useful metrics are:
+
+```bash
+curl -s http://127.0.0.1:7071/metrics | rg 'broker|spool|delivery|queue'
+curl -s http://127.0.0.1:7071/readyz | jq
+```
 
 ## End-To-End Workflow With VAmPI
 

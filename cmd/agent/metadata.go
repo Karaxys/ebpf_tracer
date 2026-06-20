@@ -340,19 +340,56 @@ func newMetadataResolver(ttl time.Duration) *metadataResolver {
 }
 
 func (r *metadataResolver) resolve(pid, fd, generation uint32) (connectionMetadata, processMetadata, containerMetadata, bool) {
+	conn, proc, container, ok, _ := r.resolveWithSource(pid, fd, generation)
+	return conn, proc, container, ok
+}
+
+type metadataSource uint8
+
+const (
+	metadataSourceNone metadataSource = iota
+	metadataSourceCache
+	metadataSourceProc
+)
+
+func (s metadataSource) String() string {
+	switch s {
+	case metadataSourceCache:
+		return "cache"
+	case metadataSourceProc:
+		return "proc"
+	default:
+		return "none"
+	}
+}
+
+func (r *metadataResolver) resolveWithSource(pid, fd, generation uint32) (connectionMetadata, processMetadata, containerMetadata, bool, metadataSource) {
 	now := time.Now()
 	key := flowKey{pid: pid, fd: fd, generation: generation}
 
+	var cachedProc processMetadata
+	var cachedContainer containerMetadata
+	var hasFreshCache bool
+
 	r.mu.Lock()
 	if entry, ok := r.cache[key]; ok && now.Sub(entry.checkedAt) < r.ttl {
-		r.mu.Unlock()
-		return entry.conn, entry.process, entry.container, entry.ok
+		if entry.ok {
+			r.mu.Unlock()
+			return entry.conn, entry.process, entry.container, true, metadataSourceCache
+		}
+		cachedProc = entry.process
+		cachedContainer = entry.container
+		hasFreshCache = true
 	}
 	r.mu.Unlock()
 
 	conn, ok := resolveConnection(pid, fd)
-	proc := resolveProcess(pid)
-	container := resolveContainer(pid)
+	proc := cachedProc
+	container := cachedContainer
+	if !hasFreshCache {
+		proc = resolveProcess(pid)
+		container = resolveContainer(pid)
+	}
 
 	r.mu.Lock()
 	r.cache[key] = metadataCacheEntry{conn: conn, process: proc, container: container, ok: ok, checkedAt: now}
@@ -366,7 +403,35 @@ func (r *metadataResolver) resolve(pid, fd, generation uint32) (connectionMetada
 	}
 	r.mu.Unlock()
 
-	return conn, proc, container, ok
+	if ok {
+		return conn, proc, container, true, metadataSourceProc
+	}
+	return conn, proc, container, false, metadataSourceNone
+}
+
+func (r *metadataResolver) remember(pid, fd, generation uint32, conn connectionMetadata, proc processMetadata, container containerMetadata) {
+	if r == nil || conn.Protocol == "" {
+		return
+	}
+	key := flowKey{pid: pid, fd: fd, generation: generation}
+	now := time.Now()
+	r.mu.Lock()
+	if entry, ok := r.cache[key]; ok && entry.ok && now.Sub(entry.checkedAt) < r.ttl {
+		r.mu.Unlock()
+		return
+	}
+	r.cache[key] = metadataCacheEntry{conn: conn, process: proc, container: container, ok: true, checkedAt: now}
+	r.mu.Unlock()
+}
+
+func (r *metadataResolver) forget(pid, fd, generation uint32) {
+	if r == nil {
+		return
+	}
+	key := flowKey{pid: pid, fd: fd, generation: generation}
+	r.mu.Lock()
+	delete(r.cache, key)
+	r.mu.Unlock()
 }
 
 func resolveProcess(pid uint32) processMetadata {
@@ -517,8 +582,8 @@ func resolveDockerContainerMetadata(containerID string) (containerMetadata, bool
 	if socketPath == "" {
 		socketPath = defaultDockerSocketPath
 	}
-	if strings.HasPrefix(socketPath, "unix://") {
-		socketPath = strings.TrimPrefix(socketPath, "unix://")
+	if trimmed, ok := strings.CutPrefix(socketPath, "unix://"); ok {
+		socketPath = trimmed
 	}
 	if _, err := os.Stat(socketPath); err != nil {
 		return containerMetadata{}, false
@@ -757,6 +822,9 @@ func findTCPConnection(pid uint32, inode string, ipv6 bool) (connectionMetadata,
 			Family:   family,
 			Role:     role,
 		}, true
+	}
+	if err := scanner.Err(); err != nil {
+		return connectionMetadata{}, false
 	}
 	return connectionMetadata{}, false
 }

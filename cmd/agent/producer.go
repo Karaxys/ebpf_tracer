@@ -31,14 +31,17 @@ type queuedKafkaMessage struct {
 }
 
 type queuedProducer struct {
-	producer *kafka.Producer
-	topic    string
-	mode     backpressureMode
-	queue    chan queuedKafkaMessage
-	stats    *agentStats
-	spool    *diskSpool
-	stop     chan struct{}
-	done     chan struct{}
+	producer               *kafka.Producer
+	topic                  string
+	mode                   backpressureMode
+	queue                  chan queuedKafkaMessage
+	stats                  *agentStats
+	spool                  *diskSpool
+	replayInterval         time.Duration
+	circuitBreakerDuration time.Duration
+	brokerDownUntil        int64
+	stop                   chan struct{}
+	done                   chan struct{}
 }
 
 type diskSpool struct {
@@ -63,19 +66,21 @@ func parseBackpressureMode(raw string) (backpressureMode, error) {
 	}
 }
 
-func newQueuedProducer(producer *kafka.Producer, topic string, mode backpressureMode, queueEvents int, stats *agentStats, spool *diskSpool) *queuedProducer {
+func newQueuedProducer(producer *kafka.Producer, topic string, mode backpressureMode, queueEvents int, stats *agentStats, spool *diskSpool, circuitBreakerDuration time.Duration) *queuedProducer {
 	if queueEvents <= 0 {
 		queueEvents = 1
 	}
 	qp := &queuedProducer{
-		producer: producer,
-		topic:    topic,
-		mode:     mode,
-		queue:    make(chan queuedKafkaMessage, queueEvents),
-		stats:    stats,
-		spool:    spool,
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		producer:               producer,
+		topic:                  topic,
+		mode:                   mode,
+		queue:                  make(chan queuedKafkaMessage, queueEvents),
+		stats:                  stats,
+		spool:                  spool,
+		replayInterval:         30 * time.Second,
+		circuitBreakerDuration: circuitBreakerDuration,
+		stop:                   make(chan struct{}),
+		done:                   make(chan struct{}),
 	}
 	qp.replaySpool()
 	go qp.run()
@@ -120,6 +125,8 @@ func (q *queuedProducer) submit(key, value []byte) {
 
 func (q *queuedProducer) run() {
 	defer close(q.done)
+	replayTicker := time.NewTicker(q.replayInterval)
+	defer replayTicker.Stop()
 	for {
 		select {
 		case <-q.stop:
@@ -127,6 +134,8 @@ func (q *queuedProducer) run() {
 			return
 		case msg := <-q.queue:
 			q.produce(msg)
+		case <-replayTicker.C:
+			q.replaySpool()
 		}
 	}
 }
@@ -159,6 +168,14 @@ func (q *queuedProducer) drain(maxWait time.Duration) {
 }
 
 func (q *queuedProducer) produce(msg queuedKafkaMessage) {
+	if q.brokerUnavailable() {
+		if q.stats != nil {
+			atomic.AddUint64(&q.stats.brokerCircuitSpool, 1)
+		}
+		q.spoolMessage("broker_unavailable", msg)
+		return
+	}
+
 	atomic.AddUint64(&q.stats.produceAttempts, 1)
 	err := q.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &q.topic, Partition: kafka.PartitionAny},
@@ -183,6 +200,46 @@ func (q *queuedProducer) close() {
 	<-q.done
 }
 
+func (q *queuedProducer) markBrokerUnavailable(reason error) {
+	if q == nil || q.circuitBreakerDuration <= 0 {
+		return
+	}
+	wasUnavailable := q.brokerUnavailable()
+	until := time.Now().Add(q.circuitBreakerDuration).UnixNano()
+	for {
+		current := atomic.LoadInt64(&q.brokerDownUntil)
+		if current >= until {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&q.brokerDownUntil, current, until) {
+			break
+		}
+	}
+	if !wasUnavailable {
+		if q.stats != nil {
+			atomic.AddUint64(&q.stats.brokerUnavailableEvents, 1)
+		}
+		log.Printf("Kafka broker circuit opened for %s: %v", q.circuitBreakerDuration, reason)
+	}
+}
+
+func (q *queuedProducer) markBrokerAvailable() {
+	if q == nil {
+		return
+	}
+	if atomic.SwapInt64(&q.brokerDownUntil, 0) > time.Now().UnixNano() {
+		log.Printf("Kafka broker circuit closed after successful delivery")
+	}
+}
+
+func (q *queuedProducer) brokerUnavailable() bool {
+	if q == nil {
+		return false
+	}
+	until := atomic.LoadInt64(&q.brokerDownUntil)
+	return until > 0 && time.Now().UnixNano() < until
+}
+
 func (q *queuedProducer) depth() int {
 	return len(q.queue)
 }
@@ -192,7 +249,14 @@ func (q *queuedProducer) spoolMessage(reason string, msg queuedKafkaMessage) {
 		return
 	}
 	if err := q.spool.write(reason, msg); err != nil {
+		if q.stats != nil {
+			atomic.AddUint64(&q.stats.spoolWriteErrors, 1)
+		}
 		log.Printf("Failed to spool Kafka message: %v", err)
+		return
+	}
+	if q.stats != nil {
+		atomic.AddUint64(&q.stats.spoolWrites, 1)
 	}
 }
 
@@ -200,7 +264,7 @@ func (q *queuedProducer) replaySpool() {
 	if q == nil || q.spool == nil {
 		return
 	}
-	messages, err := q.spool.readAll()
+	messages, err := q.spool.drainAll()
 	if err != nil {
 		log.Printf("Failed to read Kafka spool: %v", err)
 		return
@@ -217,16 +281,25 @@ func (q *queuedProducer) replaySpool() {
 			retained = append(retained, msg)
 		}
 	}
-	if err := q.spool.truncate(); err != nil {
-		log.Printf("Failed to truncate Kafka spool after replay: %v", err)
-		return
-	}
 	for _, msg := range retained {
-		if err := q.spool.write("replay_queue_full", msg); err != nil {
-			log.Printf("Failed to keep spooled Kafka message: %v", err)
-		}
+		q.spoolMessage("replay_queue_full", msg)
+	}
+	if q.stats != nil {
+		atomic.AddUint64(&q.stats.spoolReplayed, uint64(len(messages)-len(retained)))
+		atomic.AddUint64(&q.stats.spoolRetained, uint64(len(retained)))
 	}
 	log.Printf("Replayed Kafka spool messages=%d retained=%d", len(messages)-len(retained), len(retained))
+}
+
+func (q *queuedProducer) spoolBytes() int64 {
+	if q == nil || q.spool == nil {
+		return 0
+	}
+	size, err := q.spool.size()
+	if err != nil {
+		return 0
+	}
+	return size
 }
 
 func newDiskSpool(path string, maxBytes int64) (*diskSpool, error) {
@@ -283,6 +356,33 @@ func (s *diskSpool) readAll() ([]queuedKafkaMessage, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.readAllLocked()
+}
+
+func (s *diskSpool) drainAll() ([]queuedKafkaMessage, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	messages, err := s.readAllLocked()
+	if err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, nil
+	}
+	if err := os.WriteFile(s.path, nil, 0o600); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (s *diskSpool) readAllLocked() ([]queuedKafkaMessage, error) {
+	if s == nil {
+		return nil, nil
+	}
 
 	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -312,6 +412,22 @@ func (s *diskSpool) readAll() ([]queuedKafkaMessage, error) {
 		return nil, err
 	}
 	return messages, nil
+}
+
+func (s *diskSpool) size() (int64, error) {
+	if s == nil {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info, err := os.Stat(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func (s *diskSpool) truncate() error {

@@ -207,6 +207,9 @@ func matchTCPInode(pid uint32, inode string, port int, ipv6 bool) bool {
 			return true
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return false
+	}
 
 	return false
 }
@@ -292,26 +295,37 @@ type agentMetricsEvent struct {
 }
 
 type agentStats struct {
-	ringRecords        uint64
-	decodedEvents      uint64
-	decodeErrors       uint64
-	dataEvents         uint64
-	closeEvents        uint64
-	socketEvents       uint64
-	skippedNoise       uint64
-	skippedFDFilter    uint64
-	metadataMisses     uint64
-	truncatedEvents    uint64
-	bytesCaptured      uint64
-	marshalErrors      uint64
-	produceErrors      uint64
-	produceQueueFull   uint64
-	localQueueEnqueued uint64
-	localQueueDropped  uint64
-	produceAttempts    uint64
-	deliveryFailures   uint64
-	deliverySuccesses  uint64
-	ringReadErrors     uint64
+	ringRecords             uint64
+	decodedEvents           uint64
+	decodeErrors            uint64
+	dataEvents              uint64
+	closeEvents             uint64
+	socketEvents            uint64
+	skippedNoise            uint64
+	skippedFDFilter         uint64
+	metadataMisses          uint64
+	metadataCacheHits       uint64
+	metadataProcHits        uint64
+	metadataProcMisses      uint64
+	kernelTupleFallbacks    uint64
+	truncatedEvents         uint64
+	bytesCaptured           uint64
+	marshalErrors           uint64
+	produceErrors           uint64
+	produceQueueFull        uint64
+	kafkaErrors             uint64
+	brokerUnavailableEvents uint64
+	brokerCircuitSpool      uint64
+	localQueueEnqueued      uint64
+	localQueueDropped       uint64
+	produceAttempts         uint64
+	deliveryFailures        uint64
+	deliverySuccesses       uint64
+	spoolWrites             uint64
+	spoolWriteErrors        uint64
+	spoolReplayed           uint64
+	spoolRetained           uint64
+	ringReadErrors          uint64
 }
 
 func publishAgentMetrics(producer *kafka.Producer, topic string, mode targetMode, stats *agentStats, drops kernelDropSnapshot, queueDepth int) {
@@ -326,24 +340,35 @@ func publishAgentMetrics(producer *kafka.Producer, topic string, mode targetMode
 		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 		LocalQueueDepth: queueDepth,
 		Stats: map[string]uint64{
-			"ring_records":       atomic.LoadUint64(&stats.ringRecords),
-			"decoded_events":     atomic.LoadUint64(&stats.decodedEvents),
-			"decode_errors":      atomic.LoadUint64(&stats.decodeErrors),
-			"data_events":        atomic.LoadUint64(&stats.dataEvents),
-			"close_events":       atomic.LoadUint64(&stats.closeEvents),
-			"socket_events":      atomic.LoadUint64(&stats.socketEvents),
-			"skipped_noise":      atomic.LoadUint64(&stats.skippedNoise),
-			"skipped_fd_filter":  atomic.LoadUint64(&stats.skippedFDFilter),
-			"metadata_misses":    atomic.LoadUint64(&stats.metadataMisses),
-			"truncated_events":   atomic.LoadUint64(&stats.truncatedEvents),
-			"bytes_captured":     atomic.LoadUint64(&stats.bytesCaptured),
-			"marshal_errors":     atomic.LoadUint64(&stats.marshalErrors),
-			"produce_attempts":   atomic.LoadUint64(&stats.produceAttempts),
-			"produce_errors":     atomic.LoadUint64(&stats.produceErrors),
-			"produce_queue_full": atomic.LoadUint64(&stats.produceQueueFull),
-			"delivery_successes": atomic.LoadUint64(&stats.deliverySuccesses),
-			"delivery_failures":  atomic.LoadUint64(&stats.deliveryFailures),
-			"ring_read_errors":   atomic.LoadUint64(&stats.ringReadErrors),
+			"ring_records":              atomic.LoadUint64(&stats.ringRecords),
+			"decoded_events":            atomic.LoadUint64(&stats.decodedEvents),
+			"decode_errors":             atomic.LoadUint64(&stats.decodeErrors),
+			"data_events":               atomic.LoadUint64(&stats.dataEvents),
+			"close_events":              atomic.LoadUint64(&stats.closeEvents),
+			"socket_events":             atomic.LoadUint64(&stats.socketEvents),
+			"skipped_noise":             atomic.LoadUint64(&stats.skippedNoise),
+			"skipped_fd_filter":         atomic.LoadUint64(&stats.skippedFDFilter),
+			"metadata_misses":           atomic.LoadUint64(&stats.metadataMisses),
+			"metadata_cache_hits":       atomic.LoadUint64(&stats.metadataCacheHits),
+			"metadata_proc_hits":        atomic.LoadUint64(&stats.metadataProcHits),
+			"metadata_proc_misses":      atomic.LoadUint64(&stats.metadataProcMisses),
+			"kernel_tuple_fallbacks":    atomic.LoadUint64(&stats.kernelTupleFallbacks),
+			"truncated_events":          atomic.LoadUint64(&stats.truncatedEvents),
+			"bytes_captured":            atomic.LoadUint64(&stats.bytesCaptured),
+			"marshal_errors":            atomic.LoadUint64(&stats.marshalErrors),
+			"produce_attempts":          atomic.LoadUint64(&stats.produceAttempts),
+			"produce_errors":            atomic.LoadUint64(&stats.produceErrors),
+			"produce_queue_full":        atomic.LoadUint64(&stats.produceQueueFull),
+			"kafka_errors":              atomic.LoadUint64(&stats.kafkaErrors),
+			"broker_unavailable_events": atomic.LoadUint64(&stats.brokerUnavailableEvents),
+			"broker_circuit_spool":      atomic.LoadUint64(&stats.brokerCircuitSpool),
+			"delivery_successes":        atomic.LoadUint64(&stats.deliverySuccesses),
+			"delivery_failures":         atomic.LoadUint64(&stats.deliveryFailures),
+			"spool_writes":              atomic.LoadUint64(&stats.spoolWrites),
+			"spool_write_errors":        atomic.LoadUint64(&stats.spoolWriteErrors),
+			"spool_replayed":            atomic.LoadUint64(&stats.spoolReplayed),
+			"spool_retained":            atomic.LoadUint64(&stats.spoolRetained),
+			"ring_read_errors":          atomic.LoadUint64(&stats.ringReadErrors),
 		},
 		KernelDrops: map[string]uint64{
 			"ringbuf_reserve": drops.ringbufReserve,
@@ -395,6 +420,15 @@ type kernelTupleSyncer struct {
 
 func kafkaEventKey(event ApiEvent) []byte {
 	return []byte(fmt.Sprintf("%d-%d-%d", event.PID, event.FD, event.Generation))
+}
+
+func isBrokerUnavailableKafkaError(err kafka.Error) bool {
+	switch err.Code() {
+	case kafka.ErrAllBrokersDown, kafka.ErrTransport, kafka.ErrResolve:
+		return true
+	default:
+		return false
+	}
 }
 
 func readDropMetric(dropMap *ebpf.Map, idx uint32) uint64 {
@@ -671,7 +705,7 @@ func connectionFromKernelTuple(event bpf.ApiEvent) (connectionMetadata, bool) {
 
 func logAgentStats(prefix string, stats *agentStats) {
 	log.Printf(
-		"agent_stats[%s] ring_records=%d decoded=%d decode_errors=%d data=%d close=%d socket=%d skipped_noise=%d skipped_fd_filter=%d metadata_misses=%d truncated=%d bytes_captured=%d marshal_errors=%d local_queue_enqueued=%d local_queue_dropped=%d produce_attempts=%d produce_errors=%d produce_queue_full=%d delivery_successes=%d delivery_failures=%d ring_read_errors=%d",
+		"agent_stats[%s] ring_records=%d decoded=%d decode_errors=%d data=%d close=%d socket=%d skipped_noise=%d skipped_fd_filter=%d metadata_misses=%d metadata_cache_hits=%d metadata_proc_hits=%d metadata_proc_misses=%d kernel_tuple_fallbacks=%d truncated=%d bytes_captured=%d marshal_errors=%d local_queue_enqueued=%d local_queue_dropped=%d produce_attempts=%d produce_errors=%d produce_queue_full=%d kafka_errors=%d broker_unavailable_events=%d broker_circuit_spool=%d delivery_successes=%d delivery_failures=%d spool_writes=%d spool_write_errors=%d spool_replayed=%d spool_retained=%d ring_read_errors=%d",
 		prefix,
 		atomic.LoadUint64(&stats.ringRecords),
 		atomic.LoadUint64(&stats.decodedEvents),
@@ -682,6 +716,10 @@ func logAgentStats(prefix string, stats *agentStats) {
 		atomic.LoadUint64(&stats.skippedNoise),
 		atomic.LoadUint64(&stats.skippedFDFilter),
 		atomic.LoadUint64(&stats.metadataMisses),
+		atomic.LoadUint64(&stats.metadataCacheHits),
+		atomic.LoadUint64(&stats.metadataProcHits),
+		atomic.LoadUint64(&stats.metadataProcMisses),
+		atomic.LoadUint64(&stats.kernelTupleFallbacks),
 		atomic.LoadUint64(&stats.truncatedEvents),
 		atomic.LoadUint64(&stats.bytesCaptured),
 		atomic.LoadUint64(&stats.marshalErrors),
@@ -690,8 +728,15 @@ func logAgentStats(prefix string, stats *agentStats) {
 		atomic.LoadUint64(&stats.produceAttempts),
 		atomic.LoadUint64(&stats.produceErrors),
 		atomic.LoadUint64(&stats.produceQueueFull),
+		atomic.LoadUint64(&stats.kafkaErrors),
+		atomic.LoadUint64(&stats.brokerUnavailableEvents),
+		atomic.LoadUint64(&stats.brokerCircuitSpool),
 		atomic.LoadUint64(&stats.deliverySuccesses),
 		atomic.LoadUint64(&stats.deliveryFailures),
+		atomic.LoadUint64(&stats.spoolWrites),
+		atomic.LoadUint64(&stats.spoolWriteErrors),
+		atomic.LoadUint64(&stats.spoolReplayed),
+		atomic.LoadUint64(&stats.spoolRetained),
 		atomic.LoadUint64(&stats.ringReadErrors),
 	)
 }
@@ -727,6 +772,8 @@ func main() {
 	metadataTTL := flag.Duration("metadata-cache-ttl", 15*time.Second, "Connection/process/container metadata cache TTL")
 	kafkaQueueMessages := flag.Int("kafka-queue-max-messages", 200000, "Kafka producer queue.buffering.max.messages")
 	kafkaQueueKBytes := flag.Int("kafka-queue-max-kbytes", 262144, "Kafka producer queue.buffering.max.kbytes")
+	kafkaMessageTimeoutMS := flag.Int("kafka-message-timeout-ms", 30000, "Kafka producer message.timeout.ms for bounded delivery failure handling")
+	kafkaCircuitBreakerDuration := flag.Duration("kafka-circuit-breaker-duration", 15*time.Second, "Duration to spool new events after broker-down producer errors")
 	localQueueEvents := flag.Int("local-queue-events", 50000, "Bounded in-agent queue size before Kafka producer")
 	spoolFile := flag.String("spool-file", os.Getenv("KARAXYS_AGENT_SPOOL_FILE"), "Optional JSONL disk spool for Kafka produce/local queue failures")
 	spoolMaxBytes := flag.Int64("spool-max-bytes", 128*1024*1024, "Maximum bytes for the local disk spool before truncation")
@@ -924,6 +971,7 @@ func main() {
 		"queue.buffering.max.messages": *kafkaQueueMessages,
 		"queue.buffering.max.kbytes":   *kafkaQueueKBytes,
 		"queue.buffering.max.ms":       10,
+		"message.timeout.ms":           *kafkaMessageTimeoutMS,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Kafka producer: %s", err)
@@ -932,9 +980,9 @@ func main() {
 
 	// Go routine to handle Kafka delivery reports asynchronously
 	stats := &agentStats{}
-	queuedProducer := newQueuedProducer(p, *topicName, backpressure, *localQueueEvents, stats, spool)
+	queuedProducer := newQueuedProducer(p, *topicName, backpressure, *localQueueEvents, stats, spool, *kafkaCircuitBreakerDuration)
 	defer queuedProducer.close()
-	log.Printf("Producer backpressure configured mode=%s local_queue_events=%d kafka_queue_messages=%d kafka_queue_kbytes=%d", backpressure, *localQueueEvents, *kafkaQueueMessages, *kafkaQueueKBytes)
+	log.Printf("Producer backpressure configured mode=%s local_queue_events=%d kafka_queue_messages=%d kafka_queue_kbytes=%d kafka_message_timeout_ms=%d kafka_circuit_breaker_duration=%s", backpressure, *localQueueEvents, *kafkaQueueMessages, *kafkaQueueKBytes, *kafkaMessageTimeoutMS, *kafkaCircuitBreakerDuration)
 	if *healthAddr != "" {
 		healthSrv := startHealthServer(*healthAddr, stats, queuedProducer)
 		defer func() {
@@ -950,8 +998,21 @@ func main() {
 				if ev.TopicPartition.Error != nil {
 					atomic.AddUint64(&stats.deliveryFailures, 1)
 					log.Printf("Delivery failed: %v\n", ev.TopicPartition)
+					if kafkaErr, ok := ev.TopicPartition.Error.(kafka.Error); ok && isBrokerUnavailableKafkaError(kafkaErr) {
+						queuedProducer.markBrokerUnavailable(kafkaErr)
+					}
+					if len(ev.Value) > 0 {
+						queuedProducer.spoolMessage("delivery_failure", queuedKafkaMessage{key: ev.Key, value: ev.Value})
+					}
 				} else {
 					atomic.AddUint64(&stats.deliverySuccesses, 1)
+					queuedProducer.markBrokerAvailable()
+				}
+			case kafka.Error:
+				atomic.AddUint64(&stats.kafkaErrors, 1)
+				log.Printf("Kafka producer error: %v", ev)
+				if isBrokerUnavailableKafkaError(ev) {
+					queuedProducer.markBrokerUnavailable(ev)
 				}
 			}
 		}
@@ -1054,12 +1115,21 @@ loop:
 			atomic.AddUint64(&stats.truncatedEvents, 1)
 		}
 
-		conn, proc, container, metadataOK := metadata.resolve(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+		conn, proc, container, metadataOK, metadataSource := metadata.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+		switch metadataSource {
+		case metadataSourceCache:
+			atomic.AddUint64(&stats.metadataCacheHits, 1)
+		case metadataSourceProc:
+			atomic.AddUint64(&stats.metadataProcHits, 1)
+		default:
+			atomic.AddUint64(&stats.metadataProcMisses, 1)
+		}
 		if metadataOK {
 			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, conn)
 		} else if kernelConn, ok := connectionFromKernelTuple(bpfEvent); ok {
 			conn = kernelConn
 			metadataOK = true
+			atomic.AddUint64(&stats.kernelTupleFallbacks, 1)
 		}
 		if !metadataOK && bpfEvent.Fd > 2 {
 			atomic.AddUint64(&stats.metadataMisses, 1)
@@ -1099,6 +1169,7 @@ loop:
 		}
 		if event.EventType == eventTypeClose {
 			kernelTuples.forget(event.PID, event.FD, event.Generation)
+			metadata.forget(event.PID, event.FD, event.Generation)
 		}
 
 		if event.EventType == eventTypeData && isCounterNoise(event.Payload) {
