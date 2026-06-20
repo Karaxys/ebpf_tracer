@@ -32,6 +32,48 @@ func TestParseOneRequestComplete(t *testing.T) {
 	}
 }
 
+func TestSessionKeyUsesPIDFDForEBPFEvenWithConnectionMetadata(t *testing.T) {
+	event := ApiEvent{
+		CaptureSource: "ebpf",
+		PID:           19389,
+		FD:            5,
+		Generation:    81,
+		Connection: ConnectionMetadata{
+			SrcIP:    "172.17.0.2",
+			SrcPort:  5000,
+			DstIP:    "172.17.0.1",
+			DstPort:  49140,
+			Protocol: "tcp",
+			Family:   "ipv4",
+			Role:     "outbound",
+		},
+	}
+
+	if got, want := sessionKey(event), "pidfd:19389-5-81"; got != want {
+		t.Fatalf("sessionKey() = %q, want %q", got, want)
+	}
+}
+
+func TestSessionKeyUsesConnectionForNonEBPFEvents(t *testing.T) {
+	event := ApiEvent{
+		CaptureSource: "proxy",
+		PID:           19389,
+		FD:            5,
+		Generation:    81,
+		Connection: ConnectionMetadata{
+			SrcIP:    "10.0.0.10",
+			SrcPort:  51512,
+			DstIP:    "10.0.0.20",
+			DstPort:  8080,
+			Protocol: "tcp",
+		},
+	}
+
+	if got, want := sessionKey(event), "conn:tcp:10.0.0.10:51512-10.0.0.20:8080:81"; got != want {
+		t.Fatalf("sessionKey() = %q, want %q", got, want)
+	}
+}
+
 func TestParseOneRequestIncompleteBody(t *testing.T) {
 	raw := []byte("POST /submit HTTP/1.1\r\nHost: example.local\r\nContent-Length: 11\r\n\r\nhello")
 
@@ -433,6 +475,8 @@ func TestProcessEventEmitsNormalizedMetadata(t *testing.T) {
 	req.Container = ContainerMetadata{ID: "abc123", Name: "juice-shop"}
 
 	resp := testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"))
+	resp.CaptureSource = req.CaptureSource
+	resp.CaptureMode = req.CaptureMode
 	resp.Connection = req.Connection
 	resp.Process = req.Process
 	resp.Container = req.Container
@@ -477,6 +521,79 @@ func TestProcessEventPropagatesLossMetadata(t *testing.T) {
 	}
 	if !conversation.Loss.SequenceGap || conversation.Loss.ExpectedNextSeq != 2 || conversation.Loss.ActualSeq != 3 {
 		t.Fatalf("unexpected sequence gap metadata: %+v", conversation.Loss)
+	}
+}
+
+func TestProcessEventPropagatesLongPayloadChunkTruncation(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	req := testEvent(1, directionRead, []byte("POST /large HTTP/1.1\r\nHost: api.local\r\nContent-Length: 5\r\n\r\nhello"))
+	req.Loss = LossMetadata{Truncated: true, OriginalSize: 20000, CapturedSize: 16384, Reason: "payload_exceeded_agent_capture_limit"}
+	resp := testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"))
+
+	processEvent(store, cfg, stats, req)
+	processEvent(store, cfg, stats, resp)
+
+	conversation := decodeSingleConversation(t, out.String())
+	if !conversation.Loss.Truncated {
+		t.Fatalf("expected long payload truncation metadata")
+	}
+	if conversation.Loss.OriginalSize != 20000 || conversation.Loss.CapturedSize != 16384 {
+		t.Fatalf("unexpected truncation metadata: %+v", conversation.Loss)
+	}
+}
+
+func TestProcessEventDetectsSequenceGapAfterFirstZeroSeq(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	req := testEvent(0, directionRead, []byte("GET /zero HTTP/1.1\r\nHost: api.local\r\n\r\n"))
+	resp := testEvent(2, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"))
+
+	processEvent(store, cfg, stats, req)
+	processEvent(store, cfg, stats, resp)
+
+	conversation := decodeSingleConversation(t, out.String())
+	if !conversation.Loss.SequenceGap {
+		t.Fatalf("expected sequence gap after seq 0 to seq 2")
+	}
+	if conversation.Loss.ExpectedNextSeq != 1 || conversation.Loss.ActualSeq != 2 {
+		t.Fatalf("unexpected sequence gap metadata: %+v", conversation.Loss)
+	}
+}
+
+func TestProcessEventHandlesInterleavedRequestsAndResponses(t *testing.T) {
+	var out bytes.Buffer
+	cfg := testConfig(&out)
+	store := newSessionStore(cfg.sessionTTL)
+	stats := &workerStats{}
+
+	processEvent(store, cfg, stats, testEvent(1, directionRead, []byte("GET /one HTTP/1.1\r\nHost: api.local\r\n\r\n")))
+	processEvent(store, cfg, stats, testEvent(2, directionRead, []byte("GET /two HTTP/1.1\r\nHost: api.local\r\n\r\n")))
+	processEvent(store, cfg, stats, testEvent(3, directionWrite, []byte("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none")))
+	processEvent(store, cfg, stats, testEvent(4, directionWrite, []byte("HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\ntwo")))
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two conversations, got %d raw=%q", len(lines), out.String())
+	}
+	var first, second HttpConversation
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("decode first conversation: %v", err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatalf("decode second conversation: %v", err)
+	}
+	if first.Path != "/one" || first.RespStatus != "200 OK" {
+		t.Fatalf("unexpected first conversation: %+v", first)
+	}
+	if second.Path != "/two" || second.RespStatus != "201 Created" {
+		t.Fatalf("unexpected second conversation: %+v", second)
 	}
 }
 

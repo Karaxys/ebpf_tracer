@@ -2,16 +2,38 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	containerMetadataTTL     = 5 * time.Minute
+	externalMetadataTimeout  = 500 * time.Millisecond
+	defaultDockerSocketPath  = "/var/run/docker.sock"
+	defaultKubernetesAPIPort = "443"
+	serviceAccountTokenPath  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	serviceAccountCACertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+)
+
+var (
+	containerRuntimeIDPattern = regexp.MustCompile(`(?i)(docker|cri-containerd|crio|libpod)-([a-f0-9]{64})(?:\.scope)?`)
+	containerIDPattern        = regexp.MustCompile(`(?i)([a-f0-9]{64})`)
+	kubernetesPodUIDPattern   = regexp.MustCompile(`(?i)pod([0-9a-f]{8}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{12})`)
 )
 
 type portSet map[int]struct{}
@@ -61,6 +83,24 @@ func sortedPortSet(s portSet) []int {
 	}
 	sort.Ints(ports)
 	return ports
+}
+
+func clonePortSet(s portSet) portSet {
+	out := make(portSet, len(s))
+	for port := range s {
+		out[port] = struct{}{}
+	}
+	return out
+}
+
+func portSetFromInts(values []int) portSet {
+	out := make(portSet)
+	for _, port := range values {
+		if port > 0 && port <= 65535 {
+			out[port] = struct{}{}
+		}
+	}
+	return out
 }
 
 func isLikelyHTTPPayload(payload []byte) bool {
@@ -157,19 +197,39 @@ func (f *flowFilter) allow(event ApiEvent, metadataOK bool) bool {
 }
 
 func (f *flowFilter) connectionAllowed(conn connectionMetadata) bool {
-	if f.ignorePorts.matchesAny(conn.SrcPort, conn.DstPort) {
+	f.mu.Lock()
+	targetPorts := clonePortSet(f.targetPorts)
+	ignorePorts := clonePortSet(f.ignorePorts)
+	captureInbound := f.captureInbound
+	captureOutbound := f.captureOutbound
+	f.mu.Unlock()
+
+	if ignorePorts.matchesAny(conn.SrcPort, conn.DstPort) {
 		return false
 	}
-	if conn.Role == "inbound" && !f.captureInbound {
+	if conn.Role == "inbound" && !captureInbound {
 		return false
 	}
-	if conn.Role == "outbound" && !f.captureOutbound {
+	if conn.Role == "outbound" && !captureOutbound {
 		return false
 	}
-	if len(f.targetPorts) == 0 {
+	if len(targetPorts) == 0 {
 		return true
 	}
-	return f.targetPorts.matchesAny(conn.SrcPort, conn.DstPort)
+	return targetPorts.matchesAny(conn.SrcPort, conn.DstPort)
+}
+
+func (f *flowFilter) update(targetPorts, ignorePorts portSet, captureInbound, captureOutbound bool) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.targetPorts = clonePortSet(targetPorts)
+	f.ignorePorts = clonePortSet(ignorePorts)
+	f.captureInbound = captureInbound
+	f.captureOutbound = captureOutbound
+	f.flows = make(map[flowKey]cachedFlowDecision)
+	f.mu.Unlock()
 }
 
 func (f *flowFilter) lookup(key flowKey, now time.Time) (flowDecision, bool) {
@@ -223,8 +283,14 @@ type processMetadata struct {
 }
 
 type containerMetadata struct {
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Image     string `json:"image,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Pod       string `json:"pod,omitempty"`
+	Node      string `json:"node,omitempty"`
+	Runtime   string `json:"runtime,omitempty"`
+	PodUID    string `json:"pod_uid,omitempty"`
 }
 
 type lossMetadata struct {
@@ -239,7 +305,7 @@ type lossMetadata struct {
 
 type metadataResolver struct {
 	mu    sync.Mutex
-	cache map[fdKey]metadataCacheEntry
+	cache map[flowKey]metadataCacheEntry
 	ttl   time.Duration
 }
 
@@ -251,13 +317,31 @@ type metadataCacheEntry struct {
 	checkedAt time.Time
 }
 
-func newMetadataResolver(ttl time.Duration) *metadataResolver {
-	return &metadataResolver{cache: make(map[fdKey]metadataCacheEntry), ttl: ttl}
+type containerIdentity struct {
+	ID      string
+	Runtime string
+	PodUID  string
 }
 
-func (r *metadataResolver) resolve(pid, fd uint32) (connectionMetadata, processMetadata, containerMetadata, bool) {
+type containerMetadataCacheEntry struct {
+	metadata  containerMetadata
+	checkedAt time.Time
+}
+
+var containerMetadataCache = struct {
+	sync.Mutex
+	values map[string]containerMetadataCacheEntry
+}{
+	values: make(map[string]containerMetadataCacheEntry),
+}
+
+func newMetadataResolver(ttl time.Duration) *metadataResolver {
+	return &metadataResolver{cache: make(map[flowKey]metadataCacheEntry), ttl: ttl}
+}
+
+func (r *metadataResolver) resolve(pid, fd, generation uint32) (connectionMetadata, processMetadata, containerMetadata, bool) {
 	now := time.Now()
-	key := fdKey{pid: pid, fd: fd}
+	key := flowKey{pid: pid, fd: fd, generation: generation}
 
 	r.mu.Lock()
 	if entry, ok := r.cache[key]; ok && now.Sub(entry.checkedAt) < r.ttl {
@@ -298,24 +382,314 @@ func resolveContainer(pid uint32) containerMetadata {
 	if err != nil {
 		return containerMetadata{}
 	}
-	id := extractContainerID(string(cgroupBytes))
-	return containerMetadata{ID: id}
+
+	identity := extractContainerIdentity(string(cgroupBytes))
+	metadata := containerMetadata{
+		ID:      identity.ID,
+		Runtime: identity.Runtime,
+		PodUID:  identity.PodUID,
+		Node:    firstNonEmptyEnv("KARAXYS_NODE_NAME", "NODE_NAME"),
+	}
+	if identity.ID == "" && identity.PodUID == "" {
+		return metadata
+	}
+
+	cacheKey := identity.Runtime + ":" + identity.ID + ":" + identity.PodUID
+	if cached, ok := loadContainerMetadataCache(cacheKey); ok {
+		if cached.Node == "" {
+			cached.Node = metadata.Node
+		}
+		return cached
+	}
+
+	if identity.ID != "" {
+		if dockerMetadata, ok := resolveDockerContainerMetadata(identity.ID); ok {
+			mergeContainerMetadata(&metadata, dockerMetadata)
+		}
+	}
+	if identity.PodUID != "" {
+		if podMetadata, ok := resolveKubernetesPodMetadata(identity.PodUID); ok {
+			mergeContainerMetadata(&metadata, podMetadata)
+		}
+	}
+
+	storeContainerMetadataCache(cacheKey, metadata)
+	return metadata
 }
 
 func extractContainerID(cgroup string) string {
-	for _, field := range strings.FieldsFunc(cgroup, func(r rune) bool {
-		return r == '/' || r == ':' || r == '\n'
-	}) {
-		field = strings.TrimSpace(field)
-		if len(field) >= 64 && isHex(field[:64]) {
-			return field[:64]
-		}
-		if strings.HasPrefix(field, "docker-") {
-			trimmed := strings.TrimPrefix(field, "docker-")
-			trimmed = strings.TrimSuffix(trimmed, ".scope")
-			if len(trimmed) >= 64 && isHex(trimmed[:64]) {
-				return trimmed[:64]
+	return extractContainerIdentity(cgroup).ID
+}
+
+func extractContainerIdentity(cgroup string) containerIdentity {
+	identity := containerIdentity{
+		Runtime: containerRuntimeFromCgroup(cgroup),
+		PodUID:  extractKubernetesPodUID(cgroup),
+	}
+	if match := containerRuntimeIDPattern.FindStringSubmatch(cgroup); len(match) == 3 {
+		identity.Runtime = normalizeContainerRuntime(match[1])
+		identity.ID = strings.ToLower(match[2])
+		return identity
+	}
+	if match := containerIDPattern.FindStringSubmatch(cgroup); len(match) == 2 {
+		identity.ID = strings.ToLower(match[1])
+	}
+	return identity
+}
+
+func extractKubernetesPodUID(cgroup string) string {
+	match := kubernetesPodUIDPattern.FindStringSubmatch(cgroup)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.ToLower(strings.ReplaceAll(match[1], "_", "-"))
+}
+
+func containerRuntimeFromCgroup(cgroup string) string {
+	lower := strings.ToLower(cgroup)
+	switch {
+	case strings.Contains(lower, "cri-containerd"):
+		return "containerd"
+	case strings.Contains(lower, "crio"):
+		return "cri-o"
+	case strings.Contains(lower, "libpod"):
+		return "podman"
+	case strings.Contains(lower, "docker"):
+		return "docker"
+	default:
+		return ""
+	}
+}
+
+func normalizeContainerRuntime(runtime string) string {
+	switch strings.ToLower(runtime) {
+	case "cri-containerd":
+		return "containerd"
+	case "crio":
+		return "cri-o"
+	case "libpod":
+		return "podman"
+	case "docker":
+		return "docker"
+	default:
+		return strings.ToLower(runtime)
+	}
+}
+
+func loadContainerMetadataCache(key string) (containerMetadata, bool) {
+	if key == "::" {
+		return containerMetadata{}, false
+	}
+	now := time.Now()
+	containerMetadataCache.Lock()
+	defer containerMetadataCache.Unlock()
+	entry, ok := containerMetadataCache.values[key]
+	if !ok {
+		return containerMetadata{}, false
+	}
+	if now.Sub(entry.checkedAt) >= containerMetadataTTL {
+		delete(containerMetadataCache.values, key)
+		return containerMetadata{}, false
+	}
+	return entry.metadata, true
+}
+
+func storeContainerMetadataCache(key string, metadata containerMetadata) {
+	if key == "::" {
+		return
+	}
+	now := time.Now()
+	containerMetadataCache.Lock()
+	containerMetadataCache.values[key] = containerMetadataCacheEntry{metadata: metadata, checkedAt: now}
+	if len(containerMetadataCache.values) > 8192 {
+		cutoff := now.Add(-2 * containerMetadataTTL)
+		for cacheKey, entry := range containerMetadataCache.values {
+			if entry.checkedAt.Before(cutoff) {
+				delete(containerMetadataCache.values, cacheKey)
 			}
+		}
+	}
+	containerMetadataCache.Unlock()
+}
+
+func resolveDockerContainerMetadata(containerID string) (containerMetadata, bool) {
+	socketPath := firstNonEmptyEnv("KARAXYS_DOCKER_SOCKET", "DOCKER_HOST_UNIX")
+	if socketPath == "" {
+		socketPath = defaultDockerSocketPath
+	}
+	if strings.HasPrefix(socketPath, "unix://") {
+		socketPath = strings.TrimPrefix(socketPath, "unix://")
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		return containerMetadata{}, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), externalMetadataTimeout)
+	defer cancel()
+
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, "unix", socketPath)
+		},
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{Transport: transport}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/containers/"+url.PathEscape(containerID)+"/json", nil)
+	if err != nil {
+		return containerMetadata{}, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return containerMetadata{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return containerMetadata{}, false
+	}
+
+	var body struct {
+		Name   string `json:"Name"`
+		Config struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return containerMetadata{}, false
+	}
+	return containerMetadata{
+		ID:      containerID,
+		Name:    strings.TrimPrefix(body.Name, "/"),
+		Image:   body.Config.Image,
+		Runtime: "docker",
+	}, true
+}
+
+func resolveKubernetesPodMetadata(podUID string) (containerMetadata, bool) {
+	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
+	if host == "" {
+		return containerMetadata{}, false
+	}
+	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT_HTTPS"))
+	if port == "" {
+		port = strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
+	}
+	if port == "" {
+		port = defaultKubernetesAPIPort
+	}
+
+	tokenBytes, err := os.ReadFile(serviceAccountTokenPath)
+	if err != nil || len(strings.TrimSpace(string(tokenBytes))) == 0 {
+		return containerMetadata{}, false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), externalMetadataTimeout)
+	defer cancel()
+
+	values := url.Values{}
+	values.Set("fieldSelector", "metadata.uid="+podUID)
+	values.Set("limit", "1")
+	reqURL := "https://" + net.JoinHostPort(host, port) + "/api/v1/pods?" + values.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return containerMetadata{}, false
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tokenBytes)))
+	req.Header.Set("Accept", "application/json")
+
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		TLSClientConfig:   kubernetesTLSConfig(),
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	resp, err := client.Do(req)
+	if err != nil {
+		return containerMetadata{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return containerMetadata{}, false
+	}
+	return decodeKubernetesPodMetadata(json.NewDecoder(resp.Body), podUID)
+}
+
+func kubernetesTLSConfig() *tls.Config {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	caBytes, err := os.ReadFile(serviceAccountCACertPath)
+	if err != nil {
+		return cfg
+	}
+	pool := x509.NewCertPool()
+	if pool.AppendCertsFromPEM(caBytes) {
+		cfg.RootCAs = pool
+	}
+	return cfg
+}
+
+func decodeKubernetesPodMetadata(decoder *json.Decoder, podUID string) (containerMetadata, bool) {
+	var body struct {
+		Items []struct {
+			Metadata struct {
+				UID       string `json:"uid"`
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+			Spec struct {
+				NodeName string `json:"nodeName"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := decoder.Decode(&body); err != nil {
+		return containerMetadata{}, false
+	}
+	for _, item := range body.Items {
+		if !strings.EqualFold(item.Metadata.UID, podUID) {
+			continue
+		}
+		return containerMetadata{
+			PodUID:    strings.ToLower(item.Metadata.UID),
+			Pod:       item.Metadata.Name,
+			Namespace: item.Metadata.Namespace,
+			Node:      item.Spec.NodeName,
+		}, true
+	}
+	return containerMetadata{}, false
+}
+
+func mergeContainerMetadata(dst *containerMetadata, src containerMetadata) {
+	if dst.ID == "" {
+		dst.ID = src.ID
+	}
+	if dst.Name == "" {
+		dst.Name = src.Name
+	}
+	if dst.Image == "" {
+		dst.Image = src.Image
+	}
+	if dst.Namespace == "" {
+		dst.Namespace = src.Namespace
+	}
+	if dst.Pod == "" {
+		dst.Pod = src.Pod
+	}
+	if dst.Node == "" {
+		dst.Node = src.Node
+	}
+	if dst.Runtime == "" {
+		dst.Runtime = src.Runtime
+	}
+	if dst.PodUID == "" {
+		dst.PodUID = src.PodUID
+	}
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
 		}
 	}
 	return ""

@@ -16,6 +16,9 @@ import (
 )
 
 func sessionKey(event ApiEvent) string {
+	if event.CaptureSource == "ebpf" && event.PID != 0 && event.FD != 0 {
+		return fmt.Sprintf("pidfd:%d-%d-%d", event.PID, event.FD, event.Generation)
+	}
 	if event.Connection.Protocol != "" && event.Connection.SrcIP != "" && event.Connection.DstIP != "" {
 		return fmt.Sprintf("conn:%s:%s:%d-%s:%d:%d", event.Connection.Protocol, event.Connection.SrcIP, event.Connection.SrcPort, event.Connection.DstIP, event.Connection.DstPort, event.Generation)
 	}
@@ -56,7 +59,7 @@ func processEvent(store *sessionStore, cfg config, stats *workerStats, event Api
 
 	state.LastActive = time.Now()
 	mergeStreamMetadata(state, event)
-	if state.LastSeq != 0 && event.Seq > state.LastSeq+1 {
+	if state.HasLastSeq && event.Seq > state.LastSeq+1 {
 		atomic.AddUint64(&stats.outOfOrder, 1)
 		state.Loss.SequenceGap = true
 		state.Loss.ExpectedNextSeq = state.LastSeq + 1
@@ -68,8 +71,9 @@ func processEvent(store *sessionStore, cfg config, stats *workerStats, event Api
 		state.Loss.CapturedSize = event.Loss.CapturedSize
 		state.Loss.Reason = event.Loss.Reason
 	}
-	if event.Seq >= state.LastSeq {
+	if !state.HasLastSeq || event.Seq >= state.LastSeq {
 		state.LastSeq = event.Seq
+		state.HasLastSeq = true
 	}
 
 	routeAsRequest := event.Direction == directionRead

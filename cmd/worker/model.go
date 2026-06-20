@@ -153,8 +153,14 @@ type ProcessMetadata struct {
 }
 
 type ContainerMetadata struct {
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Image     string `json:"image,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Pod       string `json:"pod,omitempty"`
+	Node      string `json:"node,omitempty"`
+	Runtime   string `json:"runtime,omitempty"`
+	PodUID    string `json:"pod_uid,omitempty"`
 }
 
 type LossMetadata struct {
@@ -247,6 +253,7 @@ type StreamState struct {
 	RespData      []byte
 	PendingReqs   []parsedRequest
 	LastSeq       uint32
+	HasLastSeq    bool
 	CaptureSource string
 	CaptureMode   string
 	Connection    ConnectionMetadata

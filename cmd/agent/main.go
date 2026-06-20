@@ -37,7 +37,29 @@ const (
 	dropIovRead        = 3
 	dropMissingContext = 4
 	dropNoise          = 5
-	dropMetricMax      = 8
+	dropFDFilter       = 6
+	dropDirection      = 7
+	dropPortFilter     = 8
+	dropCgroupFilter   = 9
+	dropMetricMax      = 10
+
+	captureConfigMaxPayloadSize = 0
+	captureConfigCaptureReads   = 1
+	captureConfigCaptureWrites  = 2
+	captureConfigCaptureStdio   = 3
+	captureConfigTargetPorts    = 4
+	captureConfigCgroupFilter   = 5
+
+	maxKernelPayloadSize = 4096 * 4
+
+	kernelAFInet  = 2
+	kernelAFInet6 = 10
+
+	socketRoleInbound  = 1
+	socketRoleOutbound = 2
+
+	socketTupleLocal  = 1
+	socketTupleRemote = 2
 )
 
 type fdKey struct {
@@ -253,6 +275,20 @@ type kernelDropSnapshot struct {
 	iovRead        uint64
 	missingContext uint64
 	noise          uint64
+	fdFilter       uint64
+	direction      uint64
+	portFilter     uint64
+	cgroupFilter   uint64
+}
+
+type agentMetricsEvent struct {
+	SchemaVersion   string            `json:"schema_version"`
+	CaptureSource   string            `json:"capture_source"`
+	CaptureMode     string            `json:"capture_mode"`
+	CreatedAt       string            `json:"created_at"`
+	Stats           map[string]uint64 `json:"stats"`
+	KernelDrops     map[string]uint64 `json:"kernel_drops"`
+	LocalQueueDepth int               `json:"local_queue_depth"`
 }
 
 type agentStats struct {
@@ -276,6 +312,85 @@ type agentStats struct {
 	deliveryFailures   uint64
 	deliverySuccesses  uint64
 	ringReadErrors     uint64
+}
+
+func publishAgentMetrics(producer *kafka.Producer, topic string, mode targetMode, stats *agentStats, drops kernelDropSnapshot, queueDepth int) {
+	topic = strings.TrimSpace(topic)
+	if producer == nil || topic == "" || stats == nil {
+		return
+	}
+	event := agentMetricsEvent{
+		SchemaVersion:   "agent.metrics.v1",
+		CaptureSource:   "ebpf",
+		CaptureMode:     string(mode),
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		LocalQueueDepth: queueDepth,
+		Stats: map[string]uint64{
+			"ring_records":       atomic.LoadUint64(&stats.ringRecords),
+			"decoded_events":     atomic.LoadUint64(&stats.decodedEvents),
+			"decode_errors":      atomic.LoadUint64(&stats.decodeErrors),
+			"data_events":        atomic.LoadUint64(&stats.dataEvents),
+			"close_events":       atomic.LoadUint64(&stats.closeEvents),
+			"socket_events":      atomic.LoadUint64(&stats.socketEvents),
+			"skipped_noise":      atomic.LoadUint64(&stats.skippedNoise),
+			"skipped_fd_filter":  atomic.LoadUint64(&stats.skippedFDFilter),
+			"metadata_misses":    atomic.LoadUint64(&stats.metadataMisses),
+			"truncated_events":   atomic.LoadUint64(&stats.truncatedEvents),
+			"bytes_captured":     atomic.LoadUint64(&stats.bytesCaptured),
+			"marshal_errors":     atomic.LoadUint64(&stats.marshalErrors),
+			"produce_attempts":   atomic.LoadUint64(&stats.produceAttempts),
+			"produce_errors":     atomic.LoadUint64(&stats.produceErrors),
+			"produce_queue_full": atomic.LoadUint64(&stats.produceQueueFull),
+			"delivery_successes": atomic.LoadUint64(&stats.deliverySuccesses),
+			"delivery_failures":  atomic.LoadUint64(&stats.deliveryFailures),
+			"ring_read_errors":   atomic.LoadUint64(&stats.ringReadErrors),
+		},
+		KernelDrops: map[string]uint64{
+			"ringbuf_reserve": drops.ringbufReserve,
+			"copy_write":      drops.copyWrite,
+			"copy_read":       drops.copyRead,
+			"iov_read":        drops.iovRead,
+			"missing_context": drops.missingContext,
+			"noise":           drops.noise,
+			"fd_filter":       drops.fdFilter,
+			"direction":       drops.direction,
+			"port_filter":     drops.portFilter,
+			"cgroup_filter":   drops.cgroupFilter,
+		},
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		atomic.AddUint64(&stats.marshalErrors, 1)
+		return
+	}
+	if err := producer.Produce(&kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+		Key:            []byte("agent.metrics"),
+		Value:          payload,
+	}, nil); err != nil {
+		atomic.AddUint64(&stats.produceErrors, 1)
+		log.Printf("Failed to produce agent metrics: %v", err)
+	}
+}
+
+type kernelSocketKey struct {
+	PID        uint32
+	FD         uint32
+	Generation uint32
+}
+
+type kernelSocketTuple struct {
+	Family     uint16
+	LocalPort  uint16
+	RemotePort uint16
+	Role       uint8
+	Flags      uint8
+}
+
+type kernelTupleSyncer struct {
+	mu     sync.Mutex
+	tuples *ebpf.Map
+	synced map[flowKey]kernelSocketTuple
 }
 
 func kafkaEventKey(event ApiEvent) []byte {
@@ -302,19 +417,256 @@ func readKernelDropSnapshot(dropMap *ebpf.Map) kernelDropSnapshot {
 		iovRead:        readDropMetric(dropMap, dropIovRead),
 		missingContext: readDropMetric(dropMap, dropMissingContext),
 		noise:          readDropMetric(dropMap, dropNoise),
+		fdFilter:       readDropMetric(dropMap, dropFDFilter),
+		direction:      readDropMetric(dropMap, dropDirection),
+		portFilter:     readDropMetric(dropMap, dropPortFilter),
+		cgroupFilter:   readDropMetric(dropMap, dropCgroupFilter),
 	}
 }
 
 func logKernelDropDeltas(prev, curr kernelDropSnapshot) {
 	log.Printf(
-		"kernel_drops delta reserve=%d copy_write=%d copy_read=%d iov_read=%d missing_ctx=%d noise=%d",
+		"kernel_drops delta reserve=%d copy_write=%d copy_read=%d iov_read=%d missing_ctx=%d noise=%d fd_filter=%d direction_filter=%d port_filter=%d cgroup_filter=%d",
 		curr.ringbufReserve-prev.ringbufReserve,
 		curr.copyWrite-prev.copyWrite,
 		curr.copyRead-prev.copyRead,
 		curr.iovRead-prev.iovRead,
 		curr.missingContext-prev.missingContext,
 		curr.noise-prev.noise,
+		curr.fdFilter-prev.fdFilter,
+		curr.direction-prev.direction,
+		curr.portFilter-prev.portFilter,
+		curr.cgroupFilter-prev.cgroupFilter,
 	)
+}
+
+func boolToKernelConfig(enabled bool) uint32 {
+	if enabled {
+		return 1
+	}
+	return 0
+}
+
+func validateKernelMaxPayloadSize(size int) (uint32, error) {
+	if size <= 0 || size > maxKernelPayloadSize {
+		return 0, fmt.Errorf("kernel max payload size must be between 1 and %d bytes", maxKernelPayloadSize)
+	}
+	return uint32(size), nil
+}
+
+func putKernelCaptureConfig(configMap *ebpf.Map, key uint32, value uint32) error {
+	if configMap == nil {
+		return fmt.Errorf("capture_config map is not loaded")
+	}
+	if err := configMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update capture_config[%d]: %w", key, err)
+	}
+	return nil
+}
+
+func configureKernelCapture(configMap *ebpf.Map, maxPayload uint32, captureReads, captureWrites, captureStdio, targetPortsEnabled, cgroupFilterEnabled bool) error {
+	settings := map[uint32]uint32{
+		captureConfigMaxPayloadSize: maxPayload,
+		captureConfigCaptureReads:   boolToKernelConfig(captureReads),
+		captureConfigCaptureWrites:  boolToKernelConfig(captureWrites),
+		captureConfigCaptureStdio:   boolToKernelConfig(captureStdio),
+		captureConfigTargetPorts:    boolToKernelConfig(targetPortsEnabled),
+		captureConfigCgroupFilter:   boolToKernelConfig(cgroupFilterEnabled),
+	}
+	for key, value := range settings {
+		if err := putKernelCaptureConfig(configMap, key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func putKernelPortSet(portMap *ebpf.Map, name string, ports portSet) error {
+	if portMap == nil {
+		return fmt.Errorf("%s map is not loaded", name)
+	}
+	var enabled uint8 = 1
+	for port := range ports {
+		if port <= 0 || port > 65535 {
+			return fmt.Errorf("%s contains invalid port %d", name, port)
+		}
+		key := uint16(port)
+		if err := portMap.Update(&key, &enabled, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update %s[%d]: %w", name, port, err)
+		}
+	}
+	return nil
+}
+
+func clearKernelPortSet(portMap *ebpf.Map, name string) error {
+	if portMap == nil {
+		return fmt.Errorf("%s map is not loaded", name)
+	}
+	keys := make([]uint16, 0)
+	var key uint16
+	var value uint8
+	iter := portMap.Iterate()
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate %s: %w", name, err)
+	}
+	for _, key := range keys {
+		if err := portMap.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete %s[%d]: %w", name, key, err)
+		}
+	}
+	return nil
+}
+
+func replaceKernelPortSet(portMap *ebpf.Map, name string, ports portSet) error {
+	if err := clearKernelPortSet(portMap, name); err != nil {
+		return err
+	}
+	return putKernelPortSet(portMap, name, ports)
+}
+
+func configureKernelPortFilters(targetMap, ignoredMap *ebpf.Map, targetPorts, ignoredPorts portSet) error {
+	if err := replaceKernelPortSet(targetMap, "target_ports", targetPorts); err != nil {
+		return err
+	}
+	if err := replaceKernelPortSet(ignoredMap, "ignored_ports", ignoredPorts); err != nil {
+		return err
+	}
+	return nil
+}
+
+func attachOptionalTracepoint(category, name string, prog *ebpf.Program) link.Link {
+	tp, err := link.Tracepoint(category, name, prog, nil)
+	if err != nil {
+		log.Printf("Opening optional tracepoint %s/%s failed: %s", category, name, err)
+		return nil
+	}
+	return tp
+}
+
+func newKernelTupleSyncer(tuples *ebpf.Map) *kernelTupleSyncer {
+	return &kernelTupleSyncer{
+		tuples: tuples,
+		synced: make(map[flowKey]kernelSocketTuple),
+	}
+}
+
+func kernelFamilyFromConnection(conn connectionMetadata) uint16 {
+	switch conn.Family {
+	case "ipv4":
+		return kernelAFInet
+	case "ipv6":
+		return kernelAFInet6
+	default:
+		return 0
+	}
+}
+
+func kernelRoleFromConnection(conn connectionMetadata) uint8 {
+	switch conn.Role {
+	case "inbound":
+		return socketRoleInbound
+	case "outbound":
+		return socketRoleOutbound
+	default:
+		return 0
+	}
+}
+
+func kernelSocketTupleFromConnection(conn connectionMetadata) (kernelSocketTuple, bool) {
+	if conn.Protocol != "tcp" {
+		return kernelSocketTuple{}, false
+	}
+
+	tuple := kernelSocketTuple{
+		Family: kernelFamilyFromConnection(conn),
+		Role:   kernelRoleFromConnection(conn),
+	}
+	if conn.SrcPort > 0 && conn.SrcPort <= 65535 {
+		tuple.LocalPort = uint16(conn.SrcPort)
+		tuple.Flags |= socketTupleLocal
+	}
+	if conn.DstPort > 0 && conn.DstPort <= 65535 {
+		tuple.RemotePort = uint16(conn.DstPort)
+		tuple.Flags |= socketTupleRemote
+	}
+	if tuple.Family == 0 || tuple.Flags == 0 {
+		return kernelSocketTuple{}, false
+	}
+	return tuple, true
+}
+
+func (s *kernelTupleSyncer) remember(pid, fd, generation uint32, conn connectionMetadata) {
+	if s == nil || s.tuples == nil {
+		return
+	}
+
+	tuple, ok := kernelSocketTupleFromConnection(conn)
+	if !ok {
+		return
+	}
+
+	key := flowKey{pid: pid, fd: fd, generation: generation}
+	s.mu.Lock()
+	if existing, ok := s.synced[key]; ok && existing == tuple {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+
+	mapKey := kernelSocketKey{PID: pid, FD: fd, Generation: generation}
+	if err := s.tuples.Update(&mapKey, &tuple, ebpf.UpdateAny); err != nil {
+		log.Printf("Failed to sync socket tuple to kernel pid=%d fd=%d generation=%d: %v", pid, fd, generation, err)
+		return
+	}
+
+	s.mu.Lock()
+	s.synced[key] = tuple
+	if len(s.synced) > 65536 {
+		s.synced = make(map[flowKey]kernelSocketTuple)
+	}
+	s.mu.Unlock()
+}
+
+func (s *kernelTupleSyncer) forget(pid, fd, generation uint32) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.synced, flowKey{pid: pid, fd: fd, generation: generation})
+	s.mu.Unlock()
+}
+
+func connectionFromKernelTuple(event bpf.ApiEvent) (connectionMetadata, bool) {
+	if event.SocketTupleFlags == 0 {
+		return connectionMetadata{}, false
+	}
+
+	conn := connectionMetadata{Protocol: "tcp"}
+	switch event.SocketFamily {
+	case 4:
+		conn.Family = "ipv4"
+	case 6:
+		conn.Family = "ipv6"
+	}
+	switch event.SocketRole {
+	case socketRoleInbound:
+		conn.Role = "inbound"
+	case socketRoleOutbound:
+		conn.Role = "outbound"
+	}
+	if event.SocketTupleFlags&socketTupleLocal != 0 {
+		conn.SrcPort = int(event.LocalPort)
+	}
+	if event.SocketTupleFlags&socketTupleRemote != 0 {
+		conn.DstPort = int(event.RemotePort)
+	}
+	if conn.SrcPort == 0 && conn.DstPort == 0 {
+		return connectionMetadata{}, false
+	}
+	return conn, true
 }
 
 func logAgentStats(prefix string, stats *agentStats) {
@@ -351,8 +703,16 @@ func main() {
 	containerName := flag.String("container", "", "Container name or ID for target-mode=container")
 	targetRefreshInterval := flag.Duration("target-refresh-interval", 5*time.Second, "Target PID refresh interval for dynamic workers/containers")
 	allowAllPIDs := flag.Bool("allow-all-pids", false, "Required safety acknowledgement for target-mode=all-pids")
+	allPIDsMax := flag.Int("all-pids-max", 512, "Maximum PID count allowed for target-mode=all-pids; set <=0 to disable")
+	allPIDsRequireTargetPorts := flag.Bool("all-pids-require-target-ports", true, "Require -target-ports when target-mode=all-pids")
+	cgroupFilterEnabled := flag.Bool("cgroup-filter", true, "Enable kernel cgroup allow filtering for container target mode when cgroup IDs are resolvable")
 	bootstrapServers := flag.String("kafka-bootstrap", "localhost:9092", "Kafka bootstrap servers")
 	topicName := flag.String("topic", "raw-network-traffic", "Kafka topic for raw events")
+	backendURL := flag.String("backend-url", os.Getenv("KARAXYS_BACKEND_URL"), "Karaxys backend base URL for agent heartbeat/config polling")
+	agentToken := flag.String("agent-token", os.Getenv("KARAXYS_AGENT_TOKEN"), "Karaxys per-agent token for heartbeat/config polling")
+	agentControlTimeout := flag.Duration("agent-control-timeout", 10*time.Second, "HTTP timeout for backend heartbeat/config polling")
+	heartbeatInterval := flag.Duration("heartbeat-interval", 30*time.Second, "Agent heartbeat interval when backend-url and agent-token are set")
+	remoteConfigInterval := flag.Duration("remote-config-interval", 30*time.Second, "Remote config poll interval when backend-url and agent-token are set")
 	targetPort := flag.Int("target-port", 0, "Deprecated: single target TCP port. Prefer -target-ports")
 	targetPortsRaw := flag.String("target-ports", "", "Comma-separated TCP ports to capture. Empty allows any non-ignored socket port")
 	ignorePortsRaw := flag.String("ignore-ports", "9092,27017,6379", "Comma-separated TCP ports to ignore by default, e.g. Kafka/Mongo/Redis")
@@ -360,11 +720,17 @@ func main() {
 	allowNonSocketFDs := flag.Bool("allow-non-socket-fds", false, "Debug mode: forward non-socket FDs instead of default socket-only capture")
 	captureInbound := flag.Bool("capture-inbound", true, "Capture inbound/server-side socket traffic")
 	captureOutbound := flag.Bool("capture-outbound", true, "Capture outbound/client-side socket traffic")
+	captureReadSyscalls := flag.Bool("capture-read-syscalls", true, "Kernel-side gate for read/readv/recvfrom payload capture")
+	captureWriteSyscalls := flag.Bool("capture-write-syscalls", true, "Kernel-side gate for write/writev/sendto payload capture")
+	maxPayloadSizeRaw := flag.Int("max-payload-size", maxKernelPayloadSize, "Maximum bytes copied per syscall payload in kernel")
 	statsInterval := flag.Duration("stats-interval", 10*time.Second, "Periodic agent/kernel stats log interval")
 	metadataTTL := flag.Duration("metadata-cache-ttl", 15*time.Second, "Connection/process/container metadata cache TTL")
 	kafkaQueueMessages := flag.Int("kafka-queue-max-messages", 200000, "Kafka producer queue.buffering.max.messages")
 	kafkaQueueKBytes := flag.Int("kafka-queue-max-kbytes", 262144, "Kafka producer queue.buffering.max.kbytes")
 	localQueueEvents := flag.Int("local-queue-events", 50000, "Bounded in-agent queue size before Kafka producer")
+	spoolFile := flag.String("spool-file", os.Getenv("KARAXYS_AGENT_SPOOL_FILE"), "Optional JSONL disk spool for Kafka produce/local queue failures")
+	spoolMaxBytes := flag.Int64("spool-max-bytes", 128*1024*1024, "Maximum bytes for the local disk spool before truncation")
+	metricsTopic := flag.String("metrics-topic", "karaxys.agent.metrics", "Kafka topic for periodic agent metrics; empty disables metrics publishing")
 	backpressureRaw := flag.String("backpressure-mode", "best-effort", "Backpressure mode: best-effort, strict, drop-newest, drop-oldest")
 	healthAddr := flag.String("health-addr", "127.0.0.1:7071", "HTTP health/metrics listen address; empty disables")
 	flag.Parse()
@@ -381,11 +747,22 @@ func main() {
 	if *targetPort > 0 {
 		targetPorts[*targetPort] = struct{}{}
 	}
+	if mode == targetModeAllPIDs && *allPIDsRequireTargetPorts && len(targetPorts) == 0 {
+		log.Fatal("target-mode=all-pids requires -target-ports unless -all-pids-require-target-ports=false")
+	}
 	ignorePorts, err := parsePortSet(*ignorePortsRaw)
 	if err != nil {
 		log.Fatalf("invalid -ignore-ports: %v", err)
 	}
 	backpressure, err := parseBackpressureMode(*backpressureRaw)
+	if err != nil {
+		log.Fatal(err)
+	}
+	spool, err := newDiskSpool(*spoolFile, *spoolMaxBytes)
+	if err != nil {
+		log.Fatalf("Configuring disk spool: %v", err)
+	}
+	maxPayloadSize, err := validateKernelMaxPayloadSize(*maxPayloadSizeRaw)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -401,6 +778,17 @@ func main() {
 		log.Fatalf("Loading objects: %v", err)
 	}
 	defer objs.Close()
+	kernelTargetPortsEnabled := *fdFilterEnabled && len(targetPorts) > 0
+	kernelCgroupFilterEnabled := *cgroupFilterEnabled && mode == targetModeContainer
+	if err := configureKernelCapture(objs.CaptureConfig, maxPayloadSize, *captureReadSyscalls, *captureWriteSyscalls, *allowNonSocketFDs, kernelTargetPortsEnabled, kernelCgroupFilterEnabled); err != nil {
+		log.Fatalf("Configuring kernel capture: %v", err)
+	}
+	if *fdFilterEnabled {
+		if err := configureKernelPortFilters(objs.TargetPorts, objs.IgnoredPorts, targetPorts, ignorePorts); err != nil {
+			log.Fatalf("Configuring kernel port filters: %v", err)
+		}
+	}
+	log.Printf("Kernel capture configured max_payload_size=%d capture_read_syscalls=%t capture_write_syscalls=%t capture_stdio=%t kernel_target_ports=%t kernel_ignored_ports=%t", maxPayloadSize, *captureReadSyscalls, *captureWriteSyscalls, *allowNonSocketFDs, kernelTargetPortsEnabled, *fdFilterEnabled && len(ignorePorts) > 0)
 
 	// Resolve targets and inform the kernel which PIDs to trace.
 	targetMgr := newTargetManager(targetConfig{
@@ -409,13 +797,35 @@ func main() {
 		container:       *containerName,
 		refreshInterval: *targetRefreshInterval,
 		allowAllPIDs:    *allowAllPIDs,
-	}, objs.TargetPids)
+		maxPIDs:         *allPIDsMax,
+		cgroupFilter:    kernelCgroupFilterEnabled,
+	}, objs.TargetPids, objs.AllowedCgroups)
 	if _, err := targetMgr.refresh(); err != nil {
 		log.Fatalf("Failed to resolve initial targets: %v", err)
 	}
 	log.Printf("Successfully injected eBPF program. target_mode=%s", mode)
 
 	// Attach tracepoints to the syscalls
+	tpBind := attachOptionalTracepoint("syscalls", "sys_enter_bind", objs.TraceSysEnterBind)
+	if tpBind != nil {
+		defer tpBind.Close()
+	}
+
+	tpConnect := attachOptionalTracepoint("syscalls", "sys_enter_connect", objs.TraceSysEnterConnect)
+	if tpConnect != nil {
+		defer tpConnect.Close()
+	}
+
+	tpAcceptEnter := attachOptionalTracepoint("syscalls", "sys_enter_accept", objs.TraceSysEnterAccept)
+	if tpAcceptEnter != nil {
+		defer tpAcceptEnter.Close()
+	}
+
+	tpAccept4Enter := attachOptionalTracepoint("syscalls", "sys_enter_accept4", objs.TraceSysEnterAccept4)
+	if tpAccept4Enter != nil {
+		defer tpAccept4Enter.Close()
+	}
+
 	tpWrite, err := link.Tracepoint("syscalls", "sys_enter_write", objs.TraceSysEnterWrite, nil)
 	if err != nil {
 		log.Fatalf("Opening tracepoint sys_enter_write: %s", err)
@@ -446,6 +856,11 @@ func main() {
 	}
 	defer tpSendto.Close()
 
+	tpSendmsg := attachOptionalTracepoint("syscalls", "sys_enter_sendmsg", objs.TraceSysEnterSendmsg)
+	if tpSendmsg != nil {
+		defer tpSendmsg.Close()
+	}
+
 	tpReadvEnter, err := link.Tracepoint("syscalls", "sys_enter_readv", objs.TraceSysEnterReadv, nil)
 	if err != nil {
 		log.Fatalf("Opening tracepoint sys_enter_readv: %s", err)
@@ -469,6 +884,16 @@ func main() {
 		log.Fatalf("Opening tracepoint sys_exit_recvfrom: %s", err)
 	}
 	defer tpRecvfromExit.Close()
+
+	tpRecvmsgEnter := attachOptionalTracepoint("syscalls", "sys_enter_recvmsg", objs.TraceSysEnterRecvmsg)
+	if tpRecvmsgEnter != nil {
+		defer tpRecvmsgEnter.Close()
+	}
+
+	tpRecvmsgExit := attachOptionalTracepoint("syscalls", "sys_exit_recvmsg", objs.TraceSysExitRecvmsg)
+	if tpRecvmsgExit != nil {
+		defer tpRecvmsgExit.Close()
+	}
 
 	tpClose, err := link.Tracepoint("syscalls", "sys_enter_close", objs.TraceSysEnterClose, nil)
 	if err != nil {
@@ -507,7 +932,7 @@ func main() {
 
 	// Go routine to handle Kafka delivery reports asynchronously
 	stats := &agentStats{}
-	queuedProducer := newQueuedProducer(p, *topicName, backpressure, *localQueueEvents, stats)
+	queuedProducer := newQueuedProducer(p, *topicName, backpressure, *localQueueEvents, stats, spool)
 	defer queuedProducer.close()
 	log.Printf("Producer backpressure configured mode=%s local_queue_events=%d kafka_queue_messages=%d kafka_queue_kbytes=%d", backpressure, *localQueueEvents, *kafkaQueueMessages, *kafkaQueueKBytes)
 	if *healthAddr != "" {
@@ -565,6 +990,7 @@ func main() {
 			current := readKernelDropSnapshot(objs.DropMetrics)
 			logKernelDropDeltas(previous, current)
 			logAgentStats("periodic", stats)
+			publishAgentMetrics(p, *metricsTopic, mode, stats, current, queuedProducer.depth())
 			previous = current
 		}
 	}()
@@ -572,12 +998,21 @@ func main() {
 	// High-Speed Polling Loop
 	var bpfEvent bpf.ApiEvent // Auto-generated struct from C code
 	metadata := newMetadataResolver(*metadataTTL)
+	kernelTuples := newKernelTupleSyncer(objs.SocketTuples)
 	var flowFilter *flowFilter
 	if *fdFilterEnabled {
 		flowFilter = newFlowFilter(*metadataTTL, targetPorts, ignorePorts, *captureInbound, *captureOutbound)
 		log.Printf("Flow filter enabled target_ports=%v ignore_ports=%v inbound=%t outbound=%t", sortedPortSet(targetPorts), sortedPortSet(ignorePorts), *captureInbound, *captureOutbound)
 	} else if *allowNonSocketFDs {
 		log.Printf("WARNING: fd filter disabled and non-socket FDs allowed; use only for debugging")
+	}
+	controlClient := newAgentControlClient(*backendURL, *agentToken, *agentControlTimeout)
+	if controlClient != nil {
+		go runAgentHeartbeat(stopCh, controlClient, *heartbeatInterval, string(mode), stats, queuedProducer.depth)
+		go runAgentRemoteConfig(stopCh, controlClient, *remoteConfigInterval, func(cfg agentRemoteConfig) error {
+			return applyRemoteAgentConfig(objs, flowFilter, *fdFilterEnabled, kernelCgroupFilterEnabled, cfg)
+		})
+		log.Printf("Agent control plane enabled backend_url=%s heartbeat_interval=%s remote_config_interval=%s", *backendURL, *heartbeatInterval, *remoteConfigInterval)
 	}
 
 loop:
@@ -608,7 +1043,10 @@ loop:
 			payloadSize = len(bpfEvent.Payload)
 		}
 
-		originalSize := bpfEvent.Size
+		originalSize := bpfEvent.OriginalSize
+		if originalSize == 0 {
+			originalSize = bpfEvent.Size
+		}
 		capturedSize := uint32(payloadSize)
 		loss := lossMetadata{}
 		if originalSize > capturedSize {
@@ -616,7 +1054,13 @@ loop:
 			atomic.AddUint64(&stats.truncatedEvents, 1)
 		}
 
-		conn, proc, container, metadataOK := metadata.resolve(bpfEvent.Pid, bpfEvent.Fd)
+		conn, proc, container, metadataOK := metadata.resolve(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+		if metadataOK {
+			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, conn)
+		} else if kernelConn, ok := connectionFromKernelTuple(bpfEvent); ok {
+			conn = kernelConn
+			metadataOK = true
+		}
 		if !metadataOK && bpfEvent.Fd > 2 {
 			atomic.AddUint64(&stats.metadataMisses, 1)
 		}
@@ -652,6 +1096,9 @@ loop:
 			atomic.AddUint64(&stats.closeEvents, 1)
 		case eventTypeSocket:
 			atomic.AddUint64(&stats.socketEvents, 1)
+		}
+		if event.EventType == eventTypeClose {
+			kernelTuples.forget(event.PID, event.FD, event.Generation)
 		}
 
 		if event.EventType == eventTypeData && isCounterNoise(event.Payload) {

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -30,21 +31,27 @@ type targetConfig struct {
 	container       string
 	refreshInterval time.Duration
 	allowAllPIDs    bool
+	maxPIDs         int
+	cgroupFilter    bool
 }
 
 type targetManager struct {
-	cfg       targetConfig
-	bpfMap    *ebpf.Map
-	mu        sync.Mutex
-	active    map[uint32]struct{}
-	lastLabel string
+	cfg          targetConfig
+	bpfMap       *ebpf.Map
+	cgroupMap    *ebpf.Map
+	mu           sync.Mutex
+	active       map[uint32]struct{}
+	activeGroups map[uint64]struct{}
+	lastLabel    string
 }
 
-func newTargetManager(cfg targetConfig, bpfMap *ebpf.Map) *targetManager {
+func newTargetManager(cfg targetConfig, bpfMap *ebpf.Map, cgroupMap *ebpf.Map) *targetManager {
 	return &targetManager{
-		cfg:    cfg,
-		bpfMap: bpfMap,
-		active: make(map[uint32]struct{}),
+		cfg:          cfg,
+		bpfMap:       bpfMap,
+		cgroupMap:    cgroupMap,
+		active:       make(map[uint32]struct{}),
+		activeGroups: make(map[uint64]struct{}),
 	}
 }
 
@@ -64,6 +71,9 @@ func (m *targetManager) refresh() ([]uint32, error) {
 	}
 	if len(pids) == 0 {
 		return nil, fmt.Errorf("target resolution returned no PIDs for mode=%s", m.cfg.mode)
+	}
+	if m.cfg.mode == targetModeAllPIDs && m.cfg.maxPIDs > 0 && len(pids) > m.cfg.maxPIDs {
+		return nil, fmt.Errorf("target resolution returned %d PIDs, exceeds -all-pids-max=%d", len(pids), m.cfg.maxPIDs)
 	}
 
 	m.mu.Lock()
@@ -89,12 +99,40 @@ func (m *targetManager) refresh() ([]uint32, error) {
 	changed := !samePIDSet(m.active, next) || label != m.lastLabel
 	m.active = next
 	m.lastLabel = label
+	if err := m.refreshCgroupsLocked(pids); err != nil {
+		return nil, err
+	}
 
 	if changed {
 		log.Printf("target_refresh mode=%s label=%s active_pids=%v", m.cfg.mode, label, pids)
 	}
 
 	return pids, nil
+}
+
+func (m *targetManager) refreshCgroupsLocked(pids []uint32) error {
+	if !m.cfg.cgroupFilter || m.cgroupMap == nil {
+		return nil
+	}
+	next, err := discoverCgroupIDsForPIDs(pids)
+	if err != nil {
+		return err
+	}
+	for cgroupID := range next {
+		if _, exists := m.activeGroups[cgroupID]; !exists {
+			flag := uint8(1)
+			if err := m.cgroupMap.Put(&cgroupID, &flag); err != nil {
+				return fmt.Errorf("add cgroup id %d: %w", cgroupID, err)
+			}
+		}
+	}
+	for cgroupID := range m.activeGroups {
+		if _, stillActive := next[cgroupID]; !stillActive {
+			_ = m.cgroupMap.Delete(&cgroupID)
+		}
+	}
+	m.activeGroups = next
+	return nil
 }
 
 func (m *targetManager) run(stop <-chan struct{}) {
@@ -145,6 +183,48 @@ func resolveTargetPIDs(cfg targetConfig) ([]uint32, string, error) {
 	default:
 		return nil, "", fmt.Errorf("unsupported target mode %q", cfg.mode)
 	}
+}
+
+func discoverCgroupIDsForPIDs(pids []uint32) (map[uint64]struct{}, error) {
+	ids := make(map[uint64]struct{})
+	for _, pid := range pids {
+		cgroupID, ok := cgroupIDForPID(pid)
+		if ok {
+			ids[cgroupID] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no cgroup v2 IDs resolved for %d PIDs", len(pids))
+	}
+	return ids, nil
+}
+
+func cgroupIDForPID(pid uint32) (uint64, bool) {
+	raw, err := os.ReadFile(filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10), "cgroup"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 || fields[0] != "0" {
+			continue
+		}
+		cgroupPath := filepath.Clean("/" + strings.TrimPrefix(fields[2], "/"))
+		fullPath := filepath.Join("/sys/fs/cgroup", cgroupPath)
+		if !strings.HasPrefix(fullPath, "/sys/fs/cgroup") {
+			return 0, false
+		}
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			return 0, false
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Ino == 0 {
+			return 0, false
+		}
+		return stat.Ino, true
+	}
+	return 0, false
 }
 
 func discoverPIDTree(root uint32) ([]uint32, error) {

@@ -1,9 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,8 +36,22 @@ type queuedProducer struct {
 	mode     backpressureMode
 	queue    chan queuedKafkaMessage
 	stats    *agentStats
+	spool    *diskSpool
 	stop     chan struct{}
 	done     chan struct{}
+}
+
+type diskSpool struct {
+	mu       sync.Mutex
+	path     string
+	maxBytes int64
+}
+
+type spooledKafkaMessage struct {
+	CreatedAt string `json:"created_at"`
+	Reason    string `json:"reason"`
+	Key       string `json:"key,omitempty"`
+	Value     string `json:"value"`
 }
 
 func parseBackpressureMode(raw string) (backpressureMode, error) {
@@ -43,7 +63,7 @@ func parseBackpressureMode(raw string) (backpressureMode, error) {
 	}
 }
 
-func newQueuedProducer(producer *kafka.Producer, topic string, mode backpressureMode, queueEvents int, stats *agentStats) *queuedProducer {
+func newQueuedProducer(producer *kafka.Producer, topic string, mode backpressureMode, queueEvents int, stats *agentStats, spool *diskSpool) *queuedProducer {
 	if queueEvents <= 0 {
 		queueEvents = 1
 	}
@@ -53,9 +73,11 @@ func newQueuedProducer(producer *kafka.Producer, topic string, mode backpressure
 		mode:     mode,
 		queue:    make(chan queuedKafkaMessage, queueEvents),
 		stats:    stats,
+		spool:    spool,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
+	qp.replaySpool()
 	go qp.run()
 	return qp
 }
@@ -82,6 +104,7 @@ func (q *queuedProducer) submit(key, value []byte) {
 				atomic.AddUint64(&q.stats.localQueueEnqueued, 1)
 			default:
 				atomic.AddUint64(&q.stats.localQueueDropped, 1)
+				q.spoolMessage("local_queue_full", msg)
 			}
 		}
 	case backpressureDropNewest, backpressureBestEffort:
@@ -90,6 +113,7 @@ func (q *queuedProducer) submit(key, value []byte) {
 			atomic.AddUint64(&q.stats.localQueueEnqueued, 1)
 		default:
 			atomic.AddUint64(&q.stats.localQueueDropped, 1)
+			q.spoolMessage("local_queue_full", msg)
 		}
 	}
 }
@@ -117,7 +141,15 @@ func (q *queuedProducer) drain(maxWait time.Duration) {
 			remaining := len(q.queue)
 			if remaining > 0 {
 				atomic.AddUint64(&q.stats.localQueueDropped, uint64(remaining))
-				log.Printf("producer queue drain timed out; dropping remaining=%d", remaining)
+				for {
+					select {
+					case msg := <-q.queue:
+						q.spoolMessage("drain_timeout", msg)
+					default:
+						log.Printf("producer queue drain timed out; spooled remaining=%d", remaining)
+						return
+					}
+				}
 			}
 			return
 		default:
@@ -143,6 +175,7 @@ func (q *queuedProducer) produce(msg queuedKafkaMessage) {
 		atomic.AddUint64(&q.stats.produceQueueFull, 1)
 	}
 	log.Printf("Failed to produce to Kafka: %v", err)
+	q.spoolMessage("produce_error", msg)
 }
 
 func (q *queuedProducer) close() {
@@ -152,6 +185,156 @@ func (q *queuedProducer) close() {
 
 func (q *queuedProducer) depth() int {
 	return len(q.queue)
+}
+
+func (q *queuedProducer) spoolMessage(reason string, msg queuedKafkaMessage) {
+	if q == nil || q.spool == nil {
+		return
+	}
+	if err := q.spool.write(reason, msg); err != nil {
+		log.Printf("Failed to spool Kafka message: %v", err)
+	}
+}
+
+func (q *queuedProducer) replaySpool() {
+	if q == nil || q.spool == nil {
+		return
+	}
+	messages, err := q.spool.readAll()
+	if err != nil {
+		log.Printf("Failed to read Kafka spool: %v", err)
+		return
+	}
+	if len(messages) == 0 {
+		return
+	}
+	retained := make([]queuedKafkaMessage, 0)
+	for _, msg := range messages {
+		select {
+		case q.queue <- msg:
+			atomic.AddUint64(&q.stats.localQueueEnqueued, 1)
+		default:
+			retained = append(retained, msg)
+		}
+	}
+	if err := q.spool.truncate(); err != nil {
+		log.Printf("Failed to truncate Kafka spool after replay: %v", err)
+		return
+	}
+	for _, msg := range retained {
+		if err := q.spool.write("replay_queue_full", msg); err != nil {
+			log.Printf("Failed to keep spooled Kafka message: %v", err)
+		}
+	}
+	log.Printf("Replayed Kafka spool messages=%d retained=%d", len(messages)-len(retained), len(retained))
+}
+
+func newDiskSpool(path string, maxBytes int64) (*diskSpool, error) {
+	path = filepath.Clean(path)
+	if path == "." || path == "" {
+		return nil, nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = 128 * 1024 * 1024
+	}
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	return &diskSpool{path: path, maxBytes: maxBytes}, nil
+}
+
+func (s *diskSpool) write(reason string, msg queuedKafkaMessage) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.enforceLimitLocked(); err != nil {
+		return err
+	}
+	record := spooledKafkaMessage{
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Reason:    reason,
+		Key:       base64.StdEncoding.EncodeToString(msg.key),
+		Value:     base64.StdEncoding.EncodeToString(msg.value),
+	}
+	line, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *diskSpool) readAll() ([]queuedKafkaMessage, error) {
+	if s == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	file, err := os.Open(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var messages []queuedKafkaMessage
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		var record spooledKafkaMessage
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			continue
+		}
+		value, err := base64.StdEncoding.DecodeString(record.Value)
+		if err != nil || len(value) == 0 {
+			continue
+		}
+		key, _ := base64.StdEncoding.DecodeString(record.Key)
+		messages = append(messages, queuedKafkaMessage{key: key, value: value})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func (s *diskSpool) truncate() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return os.WriteFile(s.path, nil, 0o600)
+}
+
+func (s *diskSpool) enforceLimitLocked() error {
+	info, err := os.Stat(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Size() < s.maxBytes {
+		return nil
+	}
+	return os.WriteFile(s.path, nil, 0o600)
 }
 
 func cloneBytes(in []byte) []byte {

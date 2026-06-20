@@ -13,6 +13,13 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfAcceptContext struct {
+	_                  structs.HostLayout
+	ListenerFd         uint32
+	ListenerGeneration uint32
+	SockaddrAddr       uint64
+}
+
 type bpfReadContext struct {
 	_          structs.HostLayout
 	Fd         uint32
@@ -24,6 +31,22 @@ type bpfReadContext struct {
 	BufLen     uint32
 	Pad1       uint32
 	IovAddr    uint64
+}
+
+type bpfSocketKey struct {
+	_          structs.HostLayout
+	Pid        uint32
+	Fd         uint32
+	Generation uint32
+}
+
+type bpfSocketTuple struct {
+	_          structs.HostLayout
+	Family     uint16
+	LocalPort  uint16
+	RemotePort uint16
+	Role       uint8
+	Flags      uint8
 }
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -68,10 +91,16 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
+	TraceSysEnterAccept   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_accept"`
+	TraceSysEnterAccept4  *ebpf.ProgramSpec `ebpf:"trace_sys_enter_accept4"`
+	TraceSysEnterBind     *ebpf.ProgramSpec `ebpf:"trace_sys_enter_bind"`
 	TraceSysEnterClose    *ebpf.ProgramSpec `ebpf:"trace_sys_enter_close"`
+	TraceSysEnterConnect  *ebpf.ProgramSpec `ebpf:"trace_sys_enter_connect"`
 	TraceSysEnterRead     *ebpf.ProgramSpec `ebpf:"trace_sys_enter_read"`
 	TraceSysEnterReadv    *ebpf.ProgramSpec `ebpf:"trace_sys_enter_readv"`
 	TraceSysEnterRecvfrom *ebpf.ProgramSpec `ebpf:"trace_sys_enter_recvfrom"`
+	TraceSysEnterRecvmsg  *ebpf.ProgramSpec `ebpf:"trace_sys_enter_recvmsg"`
+	TraceSysEnterSendmsg  *ebpf.ProgramSpec `ebpf:"trace_sys_enter_sendmsg"`
 	TraceSysEnterSendto   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_sendto"`
 	TraceSysEnterWrite    *ebpf.ProgramSpec `ebpf:"trace_sys_enter_write"`
 	TraceSysEnterWritev   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_writev"`
@@ -80,18 +109,25 @@ type bpfProgramSpecs struct {
 	TraceSysExitRead      *ebpf.ProgramSpec `ebpf:"trace_sys_exit_read"`
 	TraceSysExitReadv     *ebpf.ProgramSpec `ebpf:"trace_sys_exit_readv"`
 	TraceSysExitRecvfrom  *ebpf.ProgramSpec `ebpf:"trace_sys_exit_recvfrom"`
+	TraceSysExitRecvmsg   *ebpf.ProgramSpec `ebpf:"trace_sys_exit_recvmsg"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	ActiveReads   *ebpf.MapSpec `ebpf:"active_reads"`
-	DropMetrics   *ebpf.MapSpec `ebpf:"drop_metrics"`
-	EventSeqnos   *ebpf.MapSpec `ebpf:"event_seqnos"`
-	Events        *ebpf.MapSpec `ebpf:"events"`
-	FdGenerations *ebpf.MapSpec `ebpf:"fd_generations"`
-	TargetPids    *ebpf.MapSpec `ebpf:"target_pids"`
+	ActiveAccepts  *ebpf.MapSpec `ebpf:"active_accepts"`
+	ActiveReads    *ebpf.MapSpec `ebpf:"active_reads"`
+	AllowedCgroups *ebpf.MapSpec `ebpf:"allowed_cgroups"`
+	CaptureConfig  *ebpf.MapSpec `ebpf:"capture_config"`
+	DropMetrics    *ebpf.MapSpec `ebpf:"drop_metrics"`
+	EventSeqnos    *ebpf.MapSpec `ebpf:"event_seqnos"`
+	Events         *ebpf.MapSpec `ebpf:"events"`
+	FdGenerations  *ebpf.MapSpec `ebpf:"fd_generations"`
+	IgnoredPorts   *ebpf.MapSpec `ebpf:"ignored_ports"`
+	SocketTuples   *ebpf.MapSpec `ebpf:"socket_tuples"`
+	TargetPids     *ebpf.MapSpec `ebpf:"target_pids"`
+	TargetPorts    *ebpf.MapSpec `ebpf:"target_ports"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -120,22 +156,34 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	ActiveReads   *ebpf.Map `ebpf:"active_reads"`
-	DropMetrics   *ebpf.Map `ebpf:"drop_metrics"`
-	EventSeqnos   *ebpf.Map `ebpf:"event_seqnos"`
-	Events        *ebpf.Map `ebpf:"events"`
-	FdGenerations *ebpf.Map `ebpf:"fd_generations"`
-	TargetPids    *ebpf.Map `ebpf:"target_pids"`
+	ActiveAccepts  *ebpf.Map `ebpf:"active_accepts"`
+	ActiveReads    *ebpf.Map `ebpf:"active_reads"`
+	AllowedCgroups *ebpf.Map `ebpf:"allowed_cgroups"`
+	CaptureConfig  *ebpf.Map `ebpf:"capture_config"`
+	DropMetrics    *ebpf.Map `ebpf:"drop_metrics"`
+	EventSeqnos    *ebpf.Map `ebpf:"event_seqnos"`
+	Events         *ebpf.Map `ebpf:"events"`
+	FdGenerations  *ebpf.Map `ebpf:"fd_generations"`
+	IgnoredPorts   *ebpf.Map `ebpf:"ignored_ports"`
+	SocketTuples   *ebpf.Map `ebpf:"socket_tuples"`
+	TargetPids     *ebpf.Map `ebpf:"target_pids"`
+	TargetPorts    *ebpf.Map `ebpf:"target_ports"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.ActiveAccepts,
 		m.ActiveReads,
+		m.AllowedCgroups,
+		m.CaptureConfig,
 		m.DropMetrics,
 		m.EventSeqnos,
 		m.Events,
 		m.FdGenerations,
+		m.IgnoredPorts,
+		m.SocketTuples,
 		m.TargetPids,
+		m.TargetPorts,
 	)
 }
 
@@ -149,10 +197,16 @@ type bpfVariables struct {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
+	TraceSysEnterAccept   *ebpf.Program `ebpf:"trace_sys_enter_accept"`
+	TraceSysEnterAccept4  *ebpf.Program `ebpf:"trace_sys_enter_accept4"`
+	TraceSysEnterBind     *ebpf.Program `ebpf:"trace_sys_enter_bind"`
 	TraceSysEnterClose    *ebpf.Program `ebpf:"trace_sys_enter_close"`
+	TraceSysEnterConnect  *ebpf.Program `ebpf:"trace_sys_enter_connect"`
 	TraceSysEnterRead     *ebpf.Program `ebpf:"trace_sys_enter_read"`
 	TraceSysEnterReadv    *ebpf.Program `ebpf:"trace_sys_enter_readv"`
 	TraceSysEnterRecvfrom *ebpf.Program `ebpf:"trace_sys_enter_recvfrom"`
+	TraceSysEnterRecvmsg  *ebpf.Program `ebpf:"trace_sys_enter_recvmsg"`
+	TraceSysEnterSendmsg  *ebpf.Program `ebpf:"trace_sys_enter_sendmsg"`
 	TraceSysEnterSendto   *ebpf.Program `ebpf:"trace_sys_enter_sendto"`
 	TraceSysEnterWrite    *ebpf.Program `ebpf:"trace_sys_enter_write"`
 	TraceSysEnterWritev   *ebpf.Program `ebpf:"trace_sys_enter_writev"`
@@ -161,14 +215,21 @@ type bpfPrograms struct {
 	TraceSysExitRead      *ebpf.Program `ebpf:"trace_sys_exit_read"`
 	TraceSysExitReadv     *ebpf.Program `ebpf:"trace_sys_exit_readv"`
 	TraceSysExitRecvfrom  *ebpf.Program `ebpf:"trace_sys_exit_recvfrom"`
+	TraceSysExitRecvmsg   *ebpf.Program `ebpf:"trace_sys_exit_recvmsg"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
+		p.TraceSysEnterAccept,
+		p.TraceSysEnterAccept4,
+		p.TraceSysEnterBind,
 		p.TraceSysEnterClose,
+		p.TraceSysEnterConnect,
 		p.TraceSysEnterRead,
 		p.TraceSysEnterReadv,
 		p.TraceSysEnterRecvfrom,
+		p.TraceSysEnterRecvmsg,
+		p.TraceSysEnterSendmsg,
 		p.TraceSysEnterSendto,
 		p.TraceSysEnterWrite,
 		p.TraceSysEnterWritev,
@@ -177,6 +238,7 @@ func (p *bpfPrograms) Close() error {
 		p.TraceSysExitRead,
 		p.TraceSysExitReadv,
 		p.TraceSysExitRecvfrom,
+		p.TraceSysExitRecvmsg,
 	)
 }
 
