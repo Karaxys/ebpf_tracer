@@ -1,0 +1,8 @@
+.git
+bin
+logs
+tmp
+*.test
+coverage.out
+agent-spool.jsonl
+worker-deadletters.jsonl

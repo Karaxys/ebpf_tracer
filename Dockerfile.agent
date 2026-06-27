@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+FROM golang:1.26-bookworm AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -o /out/agent ./cmd/agent \
+    && go build -trimpath -o /out/worker ./cmd/worker
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/karaxys /var/log/karaxys
+
+COPY --from=build /out/agent /usr/local/bin/karaxys-agent
+COPY --from=build /out/worker /usr/local/bin/karaxys-worker
+
+WORKDIR /var/lib/karaxys
+ENTRYPOINT ["/usr/local/bin/karaxys-agent"]
