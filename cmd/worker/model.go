@@ -50,9 +50,14 @@ type config struct {
 	outputContract   string
 	output           io.Writer
 	outputSink       string
-	backendURL       string
-	agentToken       string
-	agentID          string
+	// Legacy compat: backend base URL + per-agent token (enrollment flow).
+	backendURL string
+	agentToken string
+	// Akto-style: direct ingest URL + account-level token (no enrollment needed).
+	// When ingestURL is set it takes priority over backendURL.
+	ingestURL    string
+	accountToken string
+	agentID      string
 	httpTimeout      time.Duration
 	httpMaxRetries   int
 	httpRetryDelay   time.Duration

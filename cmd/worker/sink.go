@@ -25,9 +25,10 @@ func newConversationSink(cfg config) (conversationSink, error) {
 	case "", outputSinkStdout:
 		return nil, nil
 	case outputSinkHTTP:
+		endpoint, token := resolveHTTPSinkAuth(cfg)
 		return &httpConversationSink{
-			endpoint:       backendIngestEndpoint(cfg.backendURL),
-			agentToken:     cfg.agentToken,
+			endpoint:       endpoint,
+			agentToken:     token,
 			client:         &http.Client{Timeout: cfg.httpTimeout},
 			maxRetries:     cfg.httpMaxRetries,
 			initialBackoff: cfg.httpRetryDelay,
@@ -223,6 +224,16 @@ func writeDeadLetter(path string, sink string, emitErr error, payload []byte) er
 		return err
 	}
 	return nil
+}
+
+// resolveHTTPSinkAuth returns the (endpoint, token) to use for the HTTP sink.
+// New mode (KARAXYS_INGEST_URL + KARAXYS_ACCOUNT_TOKEN) takes priority.
+// Legacy mode (KARAXYS_BACKEND_URL + KARAXYS_AGENT_TOKEN) is the fallback.
+func resolveHTTPSinkAuth(cfg config) (endpoint, token string) {
+	if cfg.ingestURL != "" && cfg.accountToken != "" {
+		return cfg.ingestURL, cfg.accountToken
+	}
+	return backendIngestEndpoint(cfg.backendURL), cfg.agentToken
 }
 
 func backendIngestEndpoint(baseURL string) string {

@@ -20,8 +20,12 @@ func parseConfig() config {
 	debugPayload := flag.Bool("debug-payload", false, "Log short escaped payload previews while routing events")
 	outputContract := flag.String("output-contract", "normalized", "Output contract: normalized, legacy, or both")
 	outputSink := flag.String("output-sink", envString("KARAXYS_OUTPUT_SINK", defaultOutputSink), "Conversation output sink: stdout, http, or kafka")
-	backendURL := flag.String("backend-url", os.Getenv("KARAXYS_BACKEND_URL"), "Karaxys backend base URL for HTTP sink")
-	agentToken := flag.String("agent-token", os.Getenv("KARAXYS_AGENT_TOKEN"), "Karaxys agent token for HTTP sink")
+	// Akto-style account-token mode (preferred for new deployments).
+	ingestURL    := flag.String("ingest-url", os.Getenv("KARAXYS_INGEST_URL"), "Full URL of the POST /ingest endpoint (e.g. https://karaxys.example.com/ingest)")
+	accountToken := flag.String("account-token", os.Getenv("KARAXYS_ACCOUNT_TOKEN"), "Karaxys account-level ingest token (Akto-style, no enrollment required)")
+	// Legacy enrollment-based mode (kept for backward compat).
+	backendURL := flag.String("backend-url", os.Getenv("KARAXYS_BACKEND_URL"), "Karaxys backend base URL for HTTP sink (legacy; use -ingest-url instead)")
+	agentToken := flag.String("agent-token", os.Getenv("KARAXYS_AGENT_TOKEN"), "Karaxys per-agent token for HTTP sink (legacy; use -account-token instead)")
 	agentID := flag.String("agent-id", os.Getenv("KARAXYS_AGENT_ID"), "Optional agent id included in emitted conversations")
 	httpTimeout := flag.Duration("http-timeout", defaultHTTPTimeout, "HTTP sink request timeout")
 	httpMaxRetries := flag.Int("http-max-retries", defaultHTTPMaxRetries, "HTTP sink max retry attempts after the first request")
@@ -67,18 +71,48 @@ func parseConfig() config {
 		if *outputContract != "normalized" {
 			log.Fatalf("-output-sink=http requires -output-contract=normalized")
 		}
-		if *backendURL == "" {
-			log.Fatalf("-backend-url or KARAXYS_BACKEND_URL is required for -output-sink=http")
+
+		// New mode: KARAXYS_INGEST_URL + KARAXYS_ACCOUNT_TOKEN (no enrollment).
+		// Legacy mode: KARAXYS_BACKEND_URL + KARAXYS_AGENT_TOKEN (enrollment-based).
+		// New mode takes priority; both modes require a URL and a token.
+		usingNewMode := *ingestURL != "" || *accountToken != ""
+		usingLegacyMode := *backendURL != "" || *agentToken != ""
+
+		if !usingNewMode && !usingLegacyMode {
+			log.Fatalf("-output-sink=http requires either:\n" +
+				"  New:    -ingest-url / KARAXYS_INGEST_URL  +  -account-token / KARAXYS_ACCOUNT_TOKEN\n" +
+				"  Legacy: -backend-url / KARAXYS_BACKEND_URL  +  -agent-token / KARAXYS_AGENT_TOKEN")
 		}
-		parsed, err := url.ParseRequestURI(*backendURL)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-			log.Fatalf("-backend-url must be an absolute http(s) URL")
-		}
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			log.Fatalf("-backend-url must use http or https")
-		}
-		if *agentToken == "" {
-			log.Fatalf("-agent-token or KARAXYS_AGENT_TOKEN is required for -output-sink=http")
+
+		if usingNewMode {
+			if *ingestURL == "" {
+				log.Fatalf("-ingest-url or KARAXYS_INGEST_URL is required when -account-token is set")
+			}
+			if *accountToken == "" {
+				log.Fatalf("-account-token or KARAXYS_ACCOUNT_TOKEN is required when -ingest-url is set")
+			}
+			parsed, err := url.ParseRequestURI(*ingestURL)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				log.Fatalf("-ingest-url must be an absolute http(s) URL, got %q", *ingestURL)
+			}
+			if parsed.Scheme != "http" && parsed.Scheme != "https" {
+				log.Fatalf("-ingest-url must use http or https, got scheme %q", parsed.Scheme)
+			}
+		} else {
+			// Legacy mode validation.
+			if *backendURL == "" {
+				log.Fatalf("-backend-url or KARAXYS_BACKEND_URL is required for -output-sink=http")
+			}
+			parsed, err := url.ParseRequestURI(*backendURL)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				log.Fatalf("-backend-url must be an absolute http(s) URL, got %q", *backendURL)
+			}
+			if parsed.Scheme != "http" && parsed.Scheme != "https" {
+				log.Fatalf("-backend-url must use http or https, got scheme %q", parsed.Scheme)
+			}
+			if *agentToken == "" {
+				log.Fatalf("-agent-token or KARAXYS_AGENT_TOKEN is required for -output-sink=http")
+			}
 		}
 	}
 
@@ -104,6 +138,8 @@ func parseConfig() config {
 		outputContract:   *outputContract,
 		output:           os.Stdout,
 		outputSink:       *outputSink,
+		ingestURL:        *ingestURL,
+		accountToken:     *accountToken,
 		backendURL:       *backendURL,
 		agentToken:       *agentToken,
 		agentID:          *agentID,
