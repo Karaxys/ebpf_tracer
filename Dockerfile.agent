@@ -1,24 +1,42 @@
 # syntax=docker/dockerfile:1.7
-FROM golang:1.26-bookworm AS build
+# ── build ─────────────────────────────────────────────────────────────────────
+FROM golang:1.26-alpine AS build
+
+RUN apk add --no-cache gcc musl-dev elfutils-dev linux-headers
 
 WORKDIR /src
 
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -o /out/agent ./cmd/agent \
-    && go build -trimpath -o /out/worker ./cmd/worker
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/agent \
+      ./cmd/agent \
+    && go build \
+      -trimpath \
+      -ldflags="-s -w" \
+      -o /out/worker \
+      ./cmd/worker
 
-FROM debian:bookworm-slim
+# ── runtime ───────────────────────────────────────────────────────────────────
+# Alpine has far fewer CVEs than debian-slim and provides libelf for BPF loading.
+# The agent must run privileged (--privileged --pid=host) to load eBPF programs.
+FROM alpine:3.21
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
+LABEL org.opencontainers.image.title="karaxys-ebpf-agent" \
+      org.opencontainers.image.description="Karaxys eBPF traffic capture agent" \
+      org.opencontainers.image.source="https://github.com/karaxys/karaxys"
+
+RUN apk add --no-cache ca-certificates libelf \
     && mkdir -p /var/lib/karaxys /var/log/karaxys
 
-COPY --from=build /out/agent /usr/local/bin/karaxys-agent
+COPY --from=build /out/agent  /usr/local/bin/karaxys-agent
 COPY --from=build /out/worker /usr/local/bin/karaxys-worker
 
 WORKDIR /var/lib/karaxys
