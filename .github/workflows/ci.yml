@@ -1,0 +1,91 @@
+name: eBPF Tracer CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/capture
+
+jobs:
+  # ── Build & test ──────────────────────────────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install eBPF build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang llvm libbpf-dev linux-headers-$(uname -r) \
+            libelf-dev make
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Tests (no eBPF kernel load — pure Go)
+        run: go test -count=1 -timeout=120s ./...
+
+      - name: Build all binaries
+        run: |
+          go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/karaxys-capture
+          go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/agent
+          go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/worker
+
+  # ── Publish to GHCR on main ───────────────────────────────────────────────────
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-24.04
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ebpf-capture
+          cache-to: type=gha,mode=max,scope=ebpf-capture
