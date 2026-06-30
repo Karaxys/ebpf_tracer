@@ -33,7 +33,7 @@ import (
 
 const (
 	channelBufferSize = 50000
-	captureMode       = "all-pids"
+	captureMode       = "host"
 )
 
 // ── Kernel tuple syncer — mirrors our /proc-resolved connections back into the

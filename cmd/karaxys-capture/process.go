@@ -275,6 +275,7 @@ func drainParsedConversations(cfg config, stats *processingStats, state *StreamS
 		parsedReq.loss = mergeLossMetadata(parsedReq.loss, state.Loss)
 		if err := emitConversation(cfg, parsedReq, resp, respBody); err != nil {
 			atomic.AddUint64(&stats.emitErrors, 1)
+			log.Printf("emit error (req=%s %s): %v", parsedReq.req.Method, parsedReq.req.URL.RequestURI(), err)
 		}
 		parsedCount++
 		state.PendingReqs = state.PendingReqs[1:]
