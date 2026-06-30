@@ -17,17 +17,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -trimpath \
       -ldflags="-s -w" \
       -o /out/karaxys-capture \
-      ./cmd/karaxys-capture \
-    && go build \
-      -trimpath \
-      -ldflags="-s -w" \
-      -o /out/agent \
-      ./cmd/agent \
-    && go build \
-      -trimpath \
-      -ldflags="-s -w" \
-      -o /out/worker \
-      ./cmd/worker
+      ./cmd/karaxys-capture
 
 # ── runtime ───────────────────────────────────────────────────────────────────
 # Alpine has far fewer CVEs than debian-slim and provides libelf for BPF loading.
@@ -42,8 +32,6 @@ RUN apk add --no-cache ca-certificates libelf \
     && mkdir -p /var/lib/karaxys /var/log/karaxys
 
 COPY --from=build /out/karaxys-capture /usr/local/bin/karaxys-capture
-COPY --from=build /out/agent /usr/local/bin/karaxys-agent
-COPY --from=build /out/worker /usr/local/bin/karaxys-worker
 
 WORKDIR /var/lib/karaxys
 # Default: combined single-process capture (no Kafka). Use --entrypoint to switch to legacy agent.
