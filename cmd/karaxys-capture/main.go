@@ -182,18 +182,39 @@ func putKernelCaptureConfig(configMap *ebpf.Map, key uint32, value uint32) error
 	return nil
 }
 
-func configureKernelCapture(configMap *ebpf.Map, maxPayload uint32, captureReads, captureWrites bool) error {
+func configureKernelCapture(configMap *ebpf.Map, maxPayload uint32, captureReads, captureWrites, targetPortsEnabled bool) error {
 	settings := map[uint32]uint32{
 		captureConfigMaxPayloadSize: maxPayload,
 		captureConfigCaptureReads:   boolToKernelConfig(captureReads),
 		captureConfigCaptureWrites:  boolToKernelConfig(captureWrites),
 		captureConfigCaptureStdio:   0, // never capture stdio in combined binary
-		captureConfigTargetPorts:    0, // using ignorePorts only, not targetPorts
+		captureConfigTargetPorts:    boolToKernelConfig(targetPortsEnabled),
 		captureConfigCgroupFilter:   0, // cgroup filter off for all-pids mode
 	}
 	for key, value := range settings {
 		if err := putKernelCaptureConfig(configMap, key, value); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// configureKernelTargetPorts populates the target_ports BPF map so the kernel
+// drops non-matching flows before they ever reach the ring buffer. This is the
+// difference between scoped capture (reliable request/response pairing) and an
+// all-pids firehose that overwhelms userspace metadata resolution.
+func configureKernelTargetPorts(targetMap *ebpf.Map, targetPorts portSet) error {
+	if targetMap == nil {
+		return nil
+	}
+	var enabled uint8 = 1
+	for port := range targetPorts {
+		if port <= 0 || port > 65535 {
+			continue
+		}
+		key := uint16(port)
+		if err := targetMap.Update(&key, &enabled, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update target_ports[%d]: %w", port, err)
 		}
 	}
 	return nil
@@ -234,6 +255,8 @@ func main() {
 
 	ignorePortsRaw   := flag.String("ignore-ports", "9092,19092,27017,6379,9644,9100", "Comma-separated ports to suppress (Kafka/Mongo/Redis/Prometheus)")
 	targetPortsRaw   := flag.String("target-ports", "", "If set, capture only these TCP ports (empty = all non-ignored)")
+	targetPIDsRaw    := flag.String("target-pids", "", "OPT-IN scoping: capture only these PIDs (comma-separated). Empty = all-pids (capture everything).")
+	targetPIDTree    := flag.Bool("target-pid-tree", false, "When --target-pids is set, also capture descendant processes of those PIDs")
 	maxPayloadSizeRaw := flag.Int("max-payload-size", maxKernelPayloadSize, "Max bytes copied per syscall in kernel")
 
 	captureInbound  := flag.Bool("capture-inbound", true, "Capture inbound/server-side connections")
@@ -273,6 +296,16 @@ func main() {
 		log.Fatalf("invalid --target-ports: %v", err)
 	}
 
+	// Always ignore our own ingest endpoint's port. Otherwise the agent captures
+	// the very POST /ingest requests it sends to the backend, creating a runaway
+	// feedback loop (each ingested conversation generates another conversation).
+	if port := portFromURL(*ingestURL); port > 0 {
+		if _, already := ignorePorts[port]; !already {
+			ignorePorts[port] = struct{}{}
+			log.Printf("auto-ignoring ingest backend port %d to prevent capture feedback loop", port)
+		}
+	}
+
 	// ── eBPF setup ────────────────────────────────────────────────────────────
 
 	if err := bpf.SetRlimit(); err != nil {
@@ -285,21 +318,39 @@ func main() {
 	}
 	defer objs.Close()
 
-	if err := configureKernelCapture(objs.CaptureConfig, uint32(*maxPayloadSizeRaw), *captureReads, *captureWrites); err != nil {
+	// NOTE: the kernel target-ports GATE (socket_tuple_allowed) drops a flow only
+	// when its tuple has BOTH ports known and neither matches. For a server whose
+	// listener bind() happened before capture started, the accepted socket's local
+	// port is unknown, so enabling the gate silently drops its response writes.
+	// We therefore keep the kernel gate OFF and scope in userspace only.
+	const targetPortsEnabled = false
+	if err := configureKernelCapture(objs.CaptureConfig, uint32(*maxPayloadSizeRaw), *captureReads, *captureWrites, targetPortsEnabled); err != nil {
 		log.Fatalf("Configuring kernel capture: %v", err)
 	}
 	if err := configureKernelIgnorePorts(objs.IgnoredPorts, ignorePorts); err != nil {
 		log.Fatalf("Configuring kernel ignored ports: %v", err)
 	}
 
-	// ── Target manager (all-pids) ─────────────────────────────────────────────
+	// ── Target manager ────────────────────────────────────────────────────────
+	// Default: all-pids (capture everything, any app, any port). Opt-in: scope to
+	// an explicit PID set (and optionally its descendants) via --target-pids.
 
-	targetMgr := newAllPIDsTargetManager(objs.TargetPids, *allPIDsMax)
+	targetPIDs, err := parsePIDList(*targetPIDsRaw)
+	if err != nil {
+		log.Fatalf("invalid --target-pids: %v", err)
+	}
+
+	var targetMgr *allPIDsTargetManager
+	if len(targetPIDs) > 0 {
+		targetMgr = newScopedTargetManager(objs.TargetPids, *allPIDsMax, targetPIDs, *targetPIDTree)
+	} else {
+		targetMgr = newAllPIDsTargetManager(objs.TargetPids, *allPIDsMax)
+	}
 	if err := targetMgr.refresh(); err != nil {
 		log.Fatalf("Initial PID injection: %v", err)
 	}
-	log.Printf("eBPF target mode: all-pids, max=%d, ignore_ports=%v, target_ports=%v",
-		*allPIDsMax, sortedPortSet(ignorePorts), sortedPortSet(targetPorts))
+	log.Printf("eBPF target mode: %s, max=%d, ignore_ports=%v, target_ports=%v (kernel_target_ports=%t)",
+		targetMgr.mode, *allPIDsMax, sortedPortSet(ignorePorts), sortedPortSet(targetPorts), targetPortsEnabled)
 
 	// ── Tracepoints ───────────────────────────────────────────────────────────
 
@@ -498,6 +549,7 @@ func main() {
 				return
 			case <-ticker.C:
 				logCaptureStats("periodic", cStats)
+				logKernelDrops(objs.DropMetrics)
 			}
 		}
 	}()
@@ -550,30 +602,47 @@ loop:
 			atomic.AddUint64(&cStats.truncatedEvents, 1)
 		}
 
-		conn, proc, container, metadataOK, src := metaResolver.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
-		switch src {
-		case metadataSourceCache:
-			atomic.AddUint64(&cStats.metadataCacheHits, 1)
-		case metadataSourceProc:
-			atomic.AddUint64(&cStats.metadataProcHits, 1)
-		default:
-			atomic.AddUint64(&cStats.metadataProcMisses, 1)
-		}
-
-		if metadataOK {
-			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, conn)
-		} else if kernelConn, ok := connectionFromKernelTuple(bpfEvent); ok {
-			conn = kernelConn
-			metadataOK = true
-			atomic.AddUint64(&cStats.kernelTupleFallbacks, 1)
-		}
-		if !metadataOK && bpfEvent.Fd > 2 {
-			atomic.AddUint64(&cStats.metadataMisses, 1)
-		}
-
 		// Payload bytes — copy out of the BPF record buffer before it's recycled.
 		payload := make([]byte, payloadSize)
 		copy(payload, bpfEvent.Payload[:payloadSize])
+
+		atomic.AddUint64(&cStats.bytesCaptured, uint64(capturedSize))
+		switch bpfEvent.EventType {
+		case eventTypeData:
+			atomic.AddUint64(&cStats.dataEvents, 1)
+		case eventTypeClose:
+			atomic.AddUint64(&cStats.closeEvents, 1)
+		case eventTypeSocket:
+			atomic.AddUint64(&cStats.socketEvents, 1)
+		}
+
+		// Socket events carry no payload and exist only so the kernel can
+		// populate its tuple map; nothing to assemble in userspace.
+		if bpfEvent.EventType == eventTypeSocket {
+			continue
+		}
+
+		if bpfEvent.EventType == eventTypeClose {
+			kernelTuples.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+			metaResolver.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+		}
+
+		if bpfEvent.EventType == eventTypeData && isCounterNoise(payload) {
+			atomic.AddUint64(&cStats.skippedNoise, 1)
+			continue
+		}
+
+		// ── CHEAP admission decision — NO /proc here ──────────────────────────
+		// The kernel-supplied socket tuple and an HTTP-preamble sniff are both
+		// in-memory checks. Resolving /proc metadata for every one of the
+		// hundreds of thousands of noise events per second starves the ring
+		// buffer reader and causes massive in-kernel ringbuf_reserve drops
+		// (which silently lose halves of real conversations). We therefore admit
+		// on cheap signals first and only pay for /proc enrichment on survivors.
+		conn, metadataOK := connectionFromKernelTuple(bpfEvent)
+		if metadataOK {
+			atomic.AddUint64(&cStats.kernelTupleFallbacks, 1)
+		}
 
 		event := CaptureEvent{
 			SchemaVersion: "raw.network.v1",
@@ -594,29 +663,7 @@ loop:
 			Size:          capturedSize,
 			Payload:       payload,
 			Connection:    conn,
-			Process:       proc,
-			Container:     container,
 			Loss:          loss,
-		}
-
-		atomic.AddUint64(&cStats.bytesCaptured, uint64(capturedSize))
-		switch event.EventType {
-		case eventTypeData:
-			atomic.AddUint64(&cStats.dataEvents, 1)
-		case eventTypeClose:
-			atomic.AddUint64(&cStats.closeEvents, 1)
-		case eventTypeSocket:
-			atomic.AddUint64(&cStats.socketEvents, 1)
-		}
-
-		if event.EventType == eventTypeClose {
-			kernelTuples.forget(event.PID, event.FD, event.Generation)
-			metaResolver.forget(event.PID, event.FD, event.Generation)
-		}
-
-		if event.EventType == eventTypeData && isCounterNoise(event.Payload) {
-			atomic.AddUint64(&cStats.skippedNoise, 1)
-			continue
 		}
 
 		if !filter.allow(event, metadataOK) {
@@ -624,8 +671,25 @@ loop:
 			continue
 		}
 
-		if event.EventType == eventTypeSocket {
-			continue
+		// ── EXPENSIVE enrichment — only for admitted events ───────────────────
+		// Now that we know this event belongs to a flow we care about, resolve
+		// process/container/connection metadata from /proc to enrich it.
+		if procConn, proc, container, ok, src := metaResolver.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation); ok {
+			switch src {
+			case metadataSourceCache:
+				atomic.AddUint64(&cStats.metadataCacheHits, 1)
+			case metadataSourceProc:
+				atomic.AddUint64(&cStats.metadataProcHits, 1)
+			}
+			event.Connection = procConn
+			event.Process = proc
+			event.Container = container
+			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, procConn)
+		} else {
+			atomic.AddUint64(&cStats.metadataProcMisses, 1)
+			if !metadataOK && bpfEvent.Fd > 2 {
+				atomic.AddUint64(&cStats.metadataMisses, 1)
+			}
 		}
 
 		// Non-blocking send: drop rather than stall the ring buffer reader.
@@ -645,5 +709,6 @@ loop:
 	time.Sleep(2 * time.Second)
 
 	logCaptureStats("shutdown", cStats)
+	logKernelDrops(objs.DropMetrics)
 	log.Println("karaxys-capture exited cleanly.")
 }

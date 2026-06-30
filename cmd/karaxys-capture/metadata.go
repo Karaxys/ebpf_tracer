@@ -56,6 +56,47 @@ func parsePortSet(raw string) (portSet, error) {
 	return set, nil
 }
 
+// parsePIDList parses a comma-separated list of PIDs. Empty input yields nil
+// (meaning all-pids mode); blanks are skipped.
+func parsePIDList(raw string) ([]uint32, error) {
+	var pids []uint32
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pid, err := strconv.ParseUint(part, 10, 32)
+		if err != nil || pid == 0 {
+			return nil, fmt.Errorf("invalid pid %q", part)
+		}
+		pids = append(pids, uint32(pid))
+	}
+	return pids, nil
+}
+
+// portFromURL extracts the TCP port from a URL, defaulting to the well-known
+// port for the scheme when none is explicit. Returns 0 if it cannot be parsed.
+func portFromURL(raw string) int {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return 0
+	}
+	if p := u.Port(); p != "" {
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			return 0
+		}
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return 80
+	case "https":
+		return 443
+	}
+	return 0
+}
+
 func (s portSet) contains(port int) bool {
 	if len(s) == 0 {
 		return false
@@ -148,6 +189,8 @@ func (f *flowFilter) allow(event CaptureEvent, metadataOK bool) bool {
 			f.remember(key, flowDecisionAllow, now)
 			return true
 		}
+		// A resolved connection that fails the port/role policy is a stable
+		// denial — safe to cache.
 		f.remember(key, flowDecisionDeny, now)
 		return false
 	}
@@ -155,6 +198,11 @@ func (f *flowFilter) allow(event CaptureEvent, metadataOK bool) bool {
 		f.remember(key, flowDecisionAllow, now)
 		return true
 	}
+	// No metadata yet and this particular chunk does not start with an HTTP
+	// preamble. This is NOT a stable decision: the same connection may carry a
+	// well-formed request or response in a later chunk (partial reads, response
+	// after a non-HTTP-looking first segment). Caching DENY here would poison the
+	// connection and suppress its real HTTP traffic, so we drop only this chunk.
 	return false
 }
 

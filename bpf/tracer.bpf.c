@@ -142,7 +142,10 @@ struct sys_exit_ctx {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1024 * 1024);
+    /* 16 MiB. all-pids capture is a high-volume firehose; a small ring overflows
+     * and the kernel drops events at reserve time (DROP_RINGBUF_RESERVE), which
+     * silently loses halves of HTTP conversations and breaks req/resp pairing. */
+    __uint(max_entries, 16 * 1024 * 1024);
 } events SEC(".maps");
 
 struct {

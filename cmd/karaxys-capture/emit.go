@@ -11,7 +11,53 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/cilium/ebpf"
 )
+
+// Kernel drop_metrics array indices — must match the DROP_* enum in tracer.bpf.c.
+const (
+	dropRingbufReserve = 0
+	dropCopyWrite      = 1
+	dropCopyRead       = 2
+	dropIovRead        = 3
+	dropMissingContext = 4
+	dropNoise          = 5
+	dropFDFilter       = 6
+	dropDirection      = 7
+	dropPortFilter     = 8
+	dropCgroupFilter   = 9
+)
+
+func readDropMetric(dropMap *ebpf.Map, idx uint32) uint64 {
+	var value uint64
+	if err := dropMap.Lookup(&idx, &value); err != nil {
+		return 0
+	}
+	return value
+}
+
+// logKernelDrops surfaces the in-kernel drop counters. ringbuf_reserve > 0 means
+// the events ring buffer overflowed and the kernel discarded events before the
+// userspace reader ever saw them — the classic symptom of an all-pids firehose.
+func logKernelDrops(dropMap *ebpf.Map) {
+	if dropMap == nil {
+		return
+	}
+	log.Printf(
+		"kernel_drops ringbuf_reserve=%d copy_write=%d copy_read=%d iov_read=%d missing_ctx=%d noise=%d fd_filter=%d direction=%d port_filter=%d cgroup_filter=%d",
+		readDropMetric(dropMap, dropRingbufReserve),
+		readDropMetric(dropMap, dropCopyWrite),
+		readDropMetric(dropMap, dropCopyRead),
+		readDropMetric(dropMap, dropIovRead),
+		readDropMetric(dropMap, dropMissingContext),
+		readDropMetric(dropMap, dropNoise),
+		readDropMetric(dropMap, dropFDFilter),
+		readDropMetric(dropMap, dropDirection),
+		readDropMetric(dropMap, dropPortFilter),
+		readDropMetric(dropMap, dropCgroupFilter),
+	)
+}
 
 func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, respBody string) error {
 	host := parsedReq.req.Host
