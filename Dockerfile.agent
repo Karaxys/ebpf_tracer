@@ -16,6 +16,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build \
       -trimpath \
       -ldflags="-s -w" \
+      -o /out/karaxys-capture \
+      ./cmd/karaxys-capture \
+    && go build \
+      -trimpath \
+      -ldflags="-s -w" \
       -o /out/agent \
       ./cmd/agent \
     && go build \
@@ -36,8 +41,10 @@ LABEL org.opencontainers.image.title="karaxys-ebpf-agent" \
 RUN apk add --no-cache ca-certificates libelf \
     && mkdir -p /var/lib/karaxys /var/log/karaxys
 
-COPY --from=build /out/agent  /usr/local/bin/karaxys-agent
+COPY --from=build /out/karaxys-capture /usr/local/bin/karaxys-capture
+COPY --from=build /out/agent /usr/local/bin/karaxys-agent
 COPY --from=build /out/worker /usr/local/bin/karaxys-worker
 
 WORKDIR /var/lib/karaxys
-ENTRYPOINT ["/usr/local/bin/karaxys-agent"]
+# Default: combined single-process capture (no Kafka). Use --entrypoint to switch to legacy agent.
+ENTRYPOINT ["/usr/local/bin/karaxys-capture"]
