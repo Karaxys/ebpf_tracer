@@ -305,6 +305,10 @@ func main() {
 
 	objs := bpf.Objects{}
 	if err := bpf.LoadObjects(&objs, nil); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			log.Fatalf("Loading eBPF objects: %+v", ve)
+		}
 		log.Fatalf("Loading eBPF objects: %v", err)
 	}
 	defer objs.Close()

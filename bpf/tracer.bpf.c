@@ -728,6 +728,17 @@ static __always_inline int emit_data_event(__u64 id,
         }
         __u32 remaining = capture_size - offset;
         __u32 chunk_size = remaining < MAX_PAYLOAD_SIZE ? remaining : MAX_PAYLOAD_SIZE;
+        // Re-assert the same hard bound emit_data_chunk applies internally,
+        // here too: capture_size derives from a runtime-configurable map
+        // value (effective_max_payload_size), and this call site is a
+        // separately-verified inlined copy of emit_data_chunk from the one
+        // reached via emit_readv_events. A bound established once doesn't
+        // reliably survive re-inlining at a different, more complex call
+        // site (this chain: ssl_emit_ret -> emit_data_event -> here).
+        if (chunk_size >= MAX_PAYLOAD_SIZE) {
+            chunk_size = MAX_PAYLOAD_SIZE - 1;
+        }
+        chunk_size &= (MAX_PAYLOAD_SIZE - 1);
         emitted += emit_data_chunk(id,
                                    pid,
                                    fd,

@@ -674,6 +674,10 @@ func main() {
 	// Load pre-compiled eBPF objects into the kernel
 	objs := bpf.Objects{}
 	if err := bpf.LoadObjects(&objs, nil); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			log.Fatalf("Loading objects: %+v", ve)
+		}
 		log.Fatalf("Loading objects: %v", err)
 	}
 	defer objs.Close()
