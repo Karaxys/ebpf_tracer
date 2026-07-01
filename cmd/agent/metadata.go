@@ -482,10 +482,6 @@ func resolveContainer(pid uint32) containerMetadata {
 	return metadata
 }
 
-func extractContainerID(cgroup string) string {
-	return extractContainerIdentity(cgroup).ID
-}
-
 func extractContainerIdentity(cgroup string) containerIdentity {
 	identity := containerIdentity{
 		Runtime: containerRuntimeFromCgroup(cgroup),
@@ -758,11 +754,6 @@ func firstNonEmptyEnv(keys ...string) string {
 		}
 	}
 	return ""
-}
-
-func isHex(s string) bool {
-	_, err := hex.DecodeString(s)
-	return err == nil
 }
 
 func resolveConnection(pid, fd uint32) (connectionMetadata, bool) {

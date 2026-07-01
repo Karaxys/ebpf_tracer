@@ -233,7 +233,7 @@ func discoverPIDTree(root uint32) ([]uint32, error) {
 		return nil, err
 	}
 
-	seen := map[uint32]struct{}{root: struct{}{}}
+	seen := map[uint32]struct{}{root: {}}
 	queue := []uint32{root}
 	for len(queue) > 0 {
 		pid := queue[0]

@@ -49,6 +49,12 @@ type bpfSocketTuple struct {
 	Flags      uint8
 }
 
+type bpfSslArgs struct {
+	_      structs.HostLayout
+	Buf    uint64
+	LenOut uint64
+}
+
 // loadBpf returns the embedded CollectionSpec for bpf.
 func loadBpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_BpfBytes)
@@ -91,6 +97,14 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
+	ProbeEntrySSL_read    *ebpf.ProgramSpec `ebpf:"probe_entry_SSL_read"`
+	ProbeEntrySSL_readEx  *ebpf.ProgramSpec `ebpf:"probe_entry_SSL_read_ex"`
+	ProbeEntrySSL_write   *ebpf.ProgramSpec `ebpf:"probe_entry_SSL_write"`
+	ProbeEntrySSL_writeEx *ebpf.ProgramSpec `ebpf:"probe_entry_SSL_write_ex"`
+	ProbeRetSSL_read      *ebpf.ProgramSpec `ebpf:"probe_ret_SSL_read"`
+	ProbeRetSSL_readEx    *ebpf.ProgramSpec `ebpf:"probe_ret_SSL_read_ex"`
+	ProbeRetSSL_write     *ebpf.ProgramSpec `ebpf:"probe_ret_SSL_write"`
+	ProbeRetSSL_writeEx   *ebpf.ProgramSpec `ebpf:"probe_ret_SSL_write_ex"`
 	TraceSysEnterAccept   *ebpf.ProgramSpec `ebpf:"trace_sys_enter_accept"`
 	TraceSysEnterAccept4  *ebpf.ProgramSpec `ebpf:"trace_sys_enter_accept4"`
 	TraceSysEnterBind     *ebpf.ProgramSpec `ebpf:"trace_sys_enter_bind"`
@@ -116,18 +130,28 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	ActiveAccepts  *ebpf.MapSpec `ebpf:"active_accepts"`
-	ActiveReads    *ebpf.MapSpec `ebpf:"active_reads"`
-	AllowedCgroups *ebpf.MapSpec `ebpf:"allowed_cgroups"`
-	CaptureConfig  *ebpf.MapSpec `ebpf:"capture_config"`
-	DropMetrics    *ebpf.MapSpec `ebpf:"drop_metrics"`
-	EventSeqnos    *ebpf.MapSpec `ebpf:"event_seqnos"`
-	Events         *ebpf.MapSpec `ebpf:"events"`
-	FdGenerations  *ebpf.MapSpec `ebpf:"fd_generations"`
-	IgnoredPorts   *ebpf.MapSpec `ebpf:"ignored_ports"`
-	SocketTuples   *ebpf.MapSpec `ebpf:"socket_tuples"`
-	TargetPids     *ebpf.MapSpec `ebpf:"target_pids"`
-	TargetPorts    *ebpf.MapSpec `ebpf:"target_ports"`
+	ActiveAccepts   *ebpf.MapSpec `ebpf:"active_accepts"`
+	ActiveReads     *ebpf.MapSpec `ebpf:"active_reads"`
+	ActiveSslReads  *ebpf.MapSpec `ebpf:"active_ssl_reads"`
+	ActiveSslWrites *ebpf.MapSpec `ebpf:"active_ssl_writes"`
+	AllowedCgroups  *ebpf.MapSpec `ebpf:"allowed_cgroups"`
+	CaptureConfig   *ebpf.MapSpec `ebpf:"capture_config"`
+	DropMetrics     *ebpf.MapSpec `ebpf:"drop_metrics"`
+	EventSeqnos     *ebpf.MapSpec `ebpf:"event_seqnos"`
+	Events0         *ebpf.MapSpec `ebpf:"events_0"`
+	Events1         *ebpf.MapSpec `ebpf:"events_1"`
+	Events2         *ebpf.MapSpec `ebpf:"events_2"`
+	Events3         *ebpf.MapSpec `ebpf:"events_3"`
+	Events4         *ebpf.MapSpec `ebpf:"events_4"`
+	Events5         *ebpf.MapSpec `ebpf:"events_5"`
+	Events6         *ebpf.MapSpec `ebpf:"events_6"`
+	Events7         *ebpf.MapSpec `ebpf:"events_7"`
+	FdGenerations   *ebpf.MapSpec `ebpf:"fd_generations"`
+	IgnoredPorts    *ebpf.MapSpec `ebpf:"ignored_ports"`
+	SocketTuples    *ebpf.MapSpec `ebpf:"socket_tuples"`
+	TargetPids      *ebpf.MapSpec `ebpf:"target_pids"`
+	TargetPorts     *ebpf.MapSpec `ebpf:"target_ports"`
+	ThreadLastFd    *ebpf.MapSpec `ebpf:"thread_last_fd"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -156,34 +180,54 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	ActiveAccepts  *ebpf.Map `ebpf:"active_accepts"`
-	ActiveReads    *ebpf.Map `ebpf:"active_reads"`
-	AllowedCgroups *ebpf.Map `ebpf:"allowed_cgroups"`
-	CaptureConfig  *ebpf.Map `ebpf:"capture_config"`
-	DropMetrics    *ebpf.Map `ebpf:"drop_metrics"`
-	EventSeqnos    *ebpf.Map `ebpf:"event_seqnos"`
-	Events         *ebpf.Map `ebpf:"events"`
-	FdGenerations  *ebpf.Map `ebpf:"fd_generations"`
-	IgnoredPorts   *ebpf.Map `ebpf:"ignored_ports"`
-	SocketTuples   *ebpf.Map `ebpf:"socket_tuples"`
-	TargetPids     *ebpf.Map `ebpf:"target_pids"`
-	TargetPorts    *ebpf.Map `ebpf:"target_ports"`
+	ActiveAccepts   *ebpf.Map `ebpf:"active_accepts"`
+	ActiveReads     *ebpf.Map `ebpf:"active_reads"`
+	ActiveSslReads  *ebpf.Map `ebpf:"active_ssl_reads"`
+	ActiveSslWrites *ebpf.Map `ebpf:"active_ssl_writes"`
+	AllowedCgroups  *ebpf.Map `ebpf:"allowed_cgroups"`
+	CaptureConfig   *ebpf.Map `ebpf:"capture_config"`
+	DropMetrics     *ebpf.Map `ebpf:"drop_metrics"`
+	EventSeqnos     *ebpf.Map `ebpf:"event_seqnos"`
+	Events0         *ebpf.Map `ebpf:"events_0"`
+	Events1         *ebpf.Map `ebpf:"events_1"`
+	Events2         *ebpf.Map `ebpf:"events_2"`
+	Events3         *ebpf.Map `ebpf:"events_3"`
+	Events4         *ebpf.Map `ebpf:"events_4"`
+	Events5         *ebpf.Map `ebpf:"events_5"`
+	Events6         *ebpf.Map `ebpf:"events_6"`
+	Events7         *ebpf.Map `ebpf:"events_7"`
+	FdGenerations   *ebpf.Map `ebpf:"fd_generations"`
+	IgnoredPorts    *ebpf.Map `ebpf:"ignored_ports"`
+	SocketTuples    *ebpf.Map `ebpf:"socket_tuples"`
+	TargetPids      *ebpf.Map `ebpf:"target_pids"`
+	TargetPorts     *ebpf.Map `ebpf:"target_ports"`
+	ThreadLastFd    *ebpf.Map `ebpf:"thread_last_fd"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.ActiveAccepts,
 		m.ActiveReads,
+		m.ActiveSslReads,
+		m.ActiveSslWrites,
 		m.AllowedCgroups,
 		m.CaptureConfig,
 		m.DropMetrics,
 		m.EventSeqnos,
-		m.Events,
+		m.Events0,
+		m.Events1,
+		m.Events2,
+		m.Events3,
+		m.Events4,
+		m.Events5,
+		m.Events6,
+		m.Events7,
 		m.FdGenerations,
 		m.IgnoredPorts,
 		m.SocketTuples,
 		m.TargetPids,
 		m.TargetPorts,
+		m.ThreadLastFd,
 	)
 }
 
@@ -197,6 +241,14 @@ type bpfVariables struct {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
+	ProbeEntrySSL_read    *ebpf.Program `ebpf:"probe_entry_SSL_read"`
+	ProbeEntrySSL_readEx  *ebpf.Program `ebpf:"probe_entry_SSL_read_ex"`
+	ProbeEntrySSL_write   *ebpf.Program `ebpf:"probe_entry_SSL_write"`
+	ProbeEntrySSL_writeEx *ebpf.Program `ebpf:"probe_entry_SSL_write_ex"`
+	ProbeRetSSL_read      *ebpf.Program `ebpf:"probe_ret_SSL_read"`
+	ProbeRetSSL_readEx    *ebpf.Program `ebpf:"probe_ret_SSL_read_ex"`
+	ProbeRetSSL_write     *ebpf.Program `ebpf:"probe_ret_SSL_write"`
+	ProbeRetSSL_writeEx   *ebpf.Program `ebpf:"probe_ret_SSL_write_ex"`
 	TraceSysEnterAccept   *ebpf.Program `ebpf:"trace_sys_enter_accept"`
 	TraceSysEnterAccept4  *ebpf.Program `ebpf:"trace_sys_enter_accept4"`
 	TraceSysEnterBind     *ebpf.Program `ebpf:"trace_sys_enter_bind"`
@@ -220,6 +272,14 @@ type bpfPrograms struct {
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
+		p.ProbeEntrySSL_read,
+		p.ProbeEntrySSL_readEx,
+		p.ProbeEntrySSL_write,
+		p.ProbeEntrySSL_writeEx,
+		p.ProbeRetSSL_read,
+		p.ProbeRetSSL_readEx,
+		p.ProbeRetSSL_write,
+		p.ProbeRetSSL_writeEx,
 		p.TraceSysEnterAccept,
 		p.TraceSysEnterAccept4,
 		p.TraceSysEnterBind,

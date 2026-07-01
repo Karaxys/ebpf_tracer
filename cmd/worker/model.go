@@ -53,7 +53,7 @@ type config struct {
 	// Legacy compat: backend base URL + per-agent token (enrollment flow).
 	backendURL string
 	agentToken string
-	// Akto-style: direct ingest URL + account-level token (no enrollment needed).
+	// Direct ingest URL + account-level token (no enrollment needed).
 	// When ingestURL is set it takes priority over backendURL.
 	ingestURL    string
 	accountToken string

@@ -63,6 +63,22 @@ func processEvent(store *sessionStore, cfg config, stats *processingStats, event
 	state.LastActive = time.Now()
 	mergeStreamMetadata(state, event)
 
+	// For TLS connections the same fd yields both ciphertext (syscall hooks) and
+	// plaintext (SSL uprobes). Once plaintext is seen, drop the ciphertext already
+	// buffered and ignore further non-SSL events on this stream.
+	isSSL := event.Flags&eventFlagSSL != 0
+	if isSSL && !state.Ssl {
+		state.ReqData = nil
+		state.RespData = nil
+		state.PendingReqs = nil
+		state.Ssl = true
+		state.H2 = false
+		state.H2Emitted = nil
+	}
+	if state.Ssl != isSSL {
+		return
+	}
+
 	if state.HasLastSeq && event.Seq > state.LastSeq+1 {
 		atomic.AddUint64(&stats.outOfOrder, 1)
 		state.Loss.SequenceGap = true
@@ -111,20 +127,49 @@ func processEvent(store *sessionStore, cfg config, stats *processingStats, event
 		}
 	}
 
+	if !state.H2 {
+		if bytes.HasPrefix(state.ReqData, h2Preface) || bytes.HasPrefix(state.RespData, h2Preface) {
+			state.H2 = true
+		}
+	}
+
 	if cfg.debugPayload {
 		log.Printf(
-			"event pid=%d fd=%d gen=%d seq=%d dir=%d kind=%s size=%d req_buf=%d resp_buf=%d pending=%d preview=%q",
-			event.PID, event.FD, event.Generation, event.Seq, event.Direction,
+			"event pid=%d fd=%d gen=%d seq=%d dir=%d ssl=%t h2=%t kind=%s size=%d req_buf=%d resp_buf=%d pending=%d preview=%q",
+			event.PID, event.FD, event.Generation, event.Seq, event.Direction, isSSL, state.H2,
 			payloadKind.String(), len(payload),
 			len(state.ReqData), len(state.RespData), len(state.PendingReqs),
 			payloadPreview(payload, 96),
 		)
 	}
 
-	parsed := drainParsedConversations(cfg, stats, state, false)
+	parsed := drainStream(cfg, stats, state, false)
 	if parsed > 0 {
 		atomic.AddUint64(&stats.parsed, uint64(parsed))
 	}
+}
+
+func drainStream(cfg config, stats *processingStats, state *StreamState, allowCloseDelimited bool) int {
+	if state.H2 {
+		return drainH2(cfg, stats, state)
+	}
+	// Hold off until a partial preface match is resolved either way — the
+	// HTTP/1 sync-probe-window below would otherwise prune it before the
+	// full match completes if it arrives split across events.
+	if isH2PrefaceCandidate(state.ReqData) {
+		return 0
+	}
+	return drainParsedConversations(cfg, stats, state, allowCloseDelimited)
+}
+
+func isH2PrefaceCandidate(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if len(data) >= len(h2Preface) {
+		return bytes.Equal(data[:len(h2Preface)], h2Preface)
+	}
+	return bytes.Equal(data, h2Preface[:len(data)])
 }
 
 func handleCloseEvent(store *sessionStore, cfg config, stats *processingStats, event CaptureEvent) {
@@ -135,7 +180,7 @@ func handleCloseEvent(store *sessionStore, cfg config, stats *processingStats, e
 	}
 
 	state.mu.Lock()
-	parsed := drainParsedConversations(cfg, stats, state, true)
+	parsed := drainStream(cfg, stats, state, true)
 	state.mu.Unlock()
 
 	if parsed > 0 {

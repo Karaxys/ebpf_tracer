@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -12,7 +11,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,7 +39,6 @@ const (
 	dropDirection      = 7
 	dropPortFilter     = 8
 	dropCgroupFilter   = 9
-	dropMetricMax      = 10
 
 	captureConfigMaxPayloadSize = 0
 	captureConfigCaptureReads   = 1
@@ -60,94 +57,9 @@ const (
 
 	socketTupleLocal  = 1
 	socketTupleRemote = 2
+
+	eventShards = 8
 )
-
-type fdKey struct {
-	pid uint32
-	fd  uint32
-}
-
-type fdCacheEntry struct {
-	isAllowed bool
-	checkedAt time.Time
-}
-
-type fdClassifier struct {
-	mu              sync.Mutex
-	cache           map[fdKey]fdCacheEntry
-	ttl             time.Duration
-	targetPorts     portSet
-	ignorePorts     portSet
-	captureInbound  bool
-	captureOutbound bool
-}
-
-func newFDClassifier(ttl time.Duration, targetPorts, ignorePorts portSet, captureInbound, captureOutbound bool) *fdClassifier {
-	return &fdClassifier{
-		cache:           make(map[fdKey]fdCacheEntry),
-		ttl:             ttl,
-		targetPorts:     targetPorts,
-		ignorePorts:     ignorePorts,
-		captureInbound:  captureInbound,
-		captureOutbound: captureOutbound,
-	}
-}
-
-func (c *fdClassifier) isAllowed(pid, fd uint32) bool {
-	if fd <= 2 {
-		return false
-	}
-
-	now := time.Now()
-	key := fdKey{pid: pid, fd: fd}
-
-	c.mu.Lock()
-	if entry, ok := c.cache[key]; ok && now.Sub(entry.checkedAt) < c.ttl {
-		c.mu.Unlock()
-		return entry.isAllowed
-	}
-	c.mu.Unlock()
-
-	isAllowed := c.classifyFD(pid, fd)
-
-	c.mu.Lock()
-	c.cache[key] = fdCacheEntry{isAllowed: isAllowed, checkedAt: now}
-	if len(c.cache) > 16384 {
-		cutoff := now.Add(-2 * c.ttl)
-		for k, v := range c.cache {
-			if v.checkedAt.Before(cutoff) {
-				delete(c.cache, k)
-			}
-		}
-	}
-	c.mu.Unlock()
-
-	return isAllowed
-}
-
-func (c *fdClassifier) classifyFD(pid, fd uint32) bool {
-	conn, ok := resolveConnection(pid, fd)
-	if !ok {
-		return false
-	}
-
-	if c.ignorePorts.matchesAny(conn.SrcPort, conn.DstPort) {
-		return false
-	}
-
-	if conn.Role == "inbound" && !c.captureInbound {
-		return false
-	}
-	if conn.Role == "outbound" && !c.captureOutbound {
-		return false
-	}
-
-	if len(c.targetPorts) == 0 {
-		return true
-	}
-
-	return c.targetPorts.matchesAny(conn.SrcPort, conn.DstPort)
-}
 
 func socketInode(pid, fd uint32) (string, error) {
 	target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", pid, fd))
@@ -166,66 +78,6 @@ func socketInode(pid, fd uint32) (string, error) {
 	}
 
 	return target[start+1 : end], nil
-}
-
-func matchTCPInode(pid uint32, inode string, port int, ipv6 bool) bool {
-	path := fmt.Sprintf("/proc/%d/net/tcp", pid)
-	if ipv6 {
-		path = fmt.Sprintf("/proc/%d/net/tcp6", pid)
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	first := true
-	for scanner.Scan() {
-		if first {
-			first = false
-			continue
-		}
-
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 10 {
-			continue
-		}
-
-		if fields[9] != inode {
-			continue
-		}
-
-		if port <= 0 {
-			return true
-		}
-
-		localPort := parseHexPort(fields[1])
-		remotePort := parseHexPort(fields[2])
-		if localPort == port || remotePort == port {
-			return true
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return false
-	}
-
-	return false
-}
-
-func parseHexPort(addr string) int {
-	parts := strings.Split(addr, ":")
-	if len(parts) != 2 {
-		return -1
-	}
-
-	v, err := strconv.ParseInt(parts[1], 16, 32)
-	if err != nil {
-		return -1
-	}
-
-	return int(v)
 }
 
 func isCounterNoise(payload []byte) bool {
@@ -1018,12 +870,19 @@ func main() {
 		}
 	}()
 
-	// Open the BPF Ring Buffer Reader
-	rd, err := ringbuf.NewReader(objs.Events)
-	if err != nil {
-		log.Fatalf("Opening ringbuf reader: %s", err)
+	eventMaps := [eventShards]*ebpf.Map{
+		objs.Events0, objs.Events1, objs.Events2, objs.Events3,
+		objs.Events4, objs.Events5, objs.Events6, objs.Events7,
 	}
-	defer rd.Close()
+	readers := [eventShards]*ringbuf.Reader{}
+	for i, m := range eventMaps {
+		rd, err := ringbuf.NewReader(m)
+		if err != nil {
+			log.Fatalf("Opening ringbuf reader shard %d: %s", i, err)
+		}
+		defer rd.Close()
+		readers[i] = rd
+	}
 
 	log.Println("Listening for events... Press Ctrl+C to exit.")
 
@@ -1039,7 +898,9 @@ func main() {
 	go func() {
 		<-stopper
 		log.Println("Received signal, exiting...")
-		rd.Close()
+		for _, rd := range readers {
+			rd.Close()
+		}
 	}()
 
 	go func() {
@@ -1056,8 +917,6 @@ func main() {
 		}
 	}()
 
-	// High-Speed Polling Loop
-	var bpfEvent bpf.ApiEvent // Auto-generated struct from C code
 	metadata := newMetadataResolver(*metadataTTL)
 	kernelTuples := newKernelTupleSyncer(objs.SocketTuples)
 	var flowFilter *flowFilter
@@ -1076,29 +935,63 @@ func main() {
 		log.Printf("Agent control plane enabled backend_url=%s heartbeat_interval=%s remote_config_interval=%s", *backendURL, *heartbeatInterval, *remoteConfigInterval)
 	}
 
-loop:
+	shardDeps := &agentShardDeps{
+		stats:             stats,
+		metadata:          metadata,
+		kernelTuples:      kernelTuples,
+		flowFilter:        flowFilter,
+		mode:              string(mode),
+		allowNonSocketFDs: *allowNonSocketFDs,
+		queuedProducer:    queuedProducer,
+	}
+
+	var wg sync.WaitGroup
+	for i, rd := range readers {
+		wg.Add(1)
+		go func(shardID int, rd *ringbuf.Reader) {
+			defer wg.Done()
+			runAgentShardCapture(shardID, rd, shardDeps)
+		}(i, rd)
+	}
+	wg.Wait()
+
+	logAgentStats("shutdown", stats)
+	log.Println("Flushing Kafka producer before shutdown...")
+	p.Flush(5000)
+}
+
+type agentShardDeps struct {
+	stats             *agentStats
+	metadata          *metadataResolver
+	kernelTuples      *kernelTupleSyncer
+	flowFilter        *flowFilter
+	mode              string
+	allowNonSocketFDs bool
+	queuedProducer    *queuedProducer
+}
+
+func runAgentShardCapture(shardID int, rd *ringbuf.Reader, deps *agentShardDeps) {
+	stats := deps.stats
+	var bpfEvent bpf.ApiEvent
 	for {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("Ring buffer closed")
-				break loop
+				return
 			}
 			atomic.AddUint64(&stats.ringReadErrors, 1)
-			log.Printf("Error reading from ringbuf: %s", err)
+			log.Printf("shard %d: error reading from ringbuf: %s", shardID, err)
 			continue
 		}
 		atomic.AddUint64(&stats.ringRecords, 1)
 
-		// Deserialize the raw kernel bytes into our Go struct
 		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &bpfEvent); err != nil {
 			atomic.AddUint64(&stats.decodeErrors, 1)
-			log.Printf("Failed to parse ringbuf event: %v", err)
+			log.Printf("shard %d: failed to parse ringbuf event: %v", shardID, err)
 			continue
 		}
 		atomic.AddUint64(&stats.decodedEvents, 1)
 
-		// Create the Kafka payload, slicing the payload array to the actual intercepted Size
 		payloadSize := int(bpfEvent.Size)
 		if payloadSize > len(bpfEvent.Payload) {
 			payloadSize = len(bpfEvent.Payload)
@@ -1115,7 +1008,7 @@ loop:
 			atomic.AddUint64(&stats.truncatedEvents, 1)
 		}
 
-		conn, proc, container, metadataOK, metadataSource := metadata.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+		conn, proc, container, metadataOK, metadataSource := deps.metadata.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
 		switch metadataSource {
 		case metadataSourceCache:
 			atomic.AddUint64(&stats.metadataCacheHits, 1)
@@ -1125,7 +1018,7 @@ loop:
 			atomic.AddUint64(&stats.metadataProcMisses, 1)
 		}
 		if metadataOK {
-			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, conn)
+			deps.kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, conn)
 		} else if kernelConn, ok := connectionFromKernelTuple(bpfEvent); ok {
 			conn = kernelConn
 			metadataOK = true
@@ -1138,7 +1031,7 @@ loop:
 		event := ApiEvent{
 			SchemaVersion: "raw.network.v1",
 			CaptureSource: "ebpf",
-			CaptureMode:   string(mode),
+			CaptureMode:   deps.mode,
 			Timestamp:     bpfEvent.Timestamp,
 			PID:           bpfEvent.Pid,
 			TID:           bpfEvent.Tid,
@@ -1168,8 +1061,8 @@ loop:
 			atomic.AddUint64(&stats.socketEvents, 1)
 		}
 		if event.EventType == eventTypeClose {
-			kernelTuples.forget(event.PID, event.FD, event.Generation)
-			metadata.forget(event.PID, event.FD, event.Generation)
+			deps.kernelTuples.forget(event.PID, event.FD, event.Generation)
+			deps.metadata.forget(event.PID, event.FD, event.Generation)
 		}
 
 		if event.EventType == eventTypeData && isCounterNoise(event.Payload) {
@@ -1177,14 +1070,14 @@ loop:
 			continue
 		}
 
-		if flowFilter != nil && !flowFilter.allow(event, metadataOK) {
+		if deps.flowFilter != nil && !deps.flowFilter.allow(event, metadataOK) {
 			atomic.AddUint64(&stats.skippedFDFilter, 1)
 			continue
 		}
 		if event.EventType == eventTypeSocket {
 			continue
 		}
-		if flowFilter == nil && !*allowNonSocketFDs && event.FD <= 2 {
+		if deps.flowFilter == nil && !deps.allowNonSocketFDs && event.FD <= 2 {
 			atomic.AddUint64(&stats.skippedFDFilter, 1)
 			continue
 		}
@@ -1192,14 +1085,10 @@ loop:
 		jsonBytes, err := json.Marshal(event)
 		if err != nil {
 			atomic.AddUint64(&stats.marshalErrors, 1)
-			log.Printf("Failed to marshal JSON: %v", err)
+			log.Printf("shard %d: failed to marshal JSON: %v", shardID, err)
 			continue
 		}
 
-		queuedProducer.submit(kafkaEventKey(event), jsonBytes)
+		deps.queuedProducer.submit(kafkaEventKey(event), jsonBytes)
 	}
-
-	logAgentStats("shutdown", stats)
-	log.Println("Flushing Kafka producer before shutdown...")
-	p.Flush(5000)
 }

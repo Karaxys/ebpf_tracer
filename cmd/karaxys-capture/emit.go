@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cilium/ebpf"
 )
@@ -103,6 +105,10 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 		},
 	}
 
+	return emitNormalized(cfg, normalized)
+}
+
+func emitNormalized(cfg config, normalized NormalizedConversation) error {
 	payload, err := json.Marshal(normalized)
 	if err != nil {
 		log.Printf("Failed to marshal conversation: %v", err)
@@ -122,6 +128,25 @@ func emitConversation(cfg config, parsedReq parsedRequest, resp *http.Response, 
 	return nil
 }
 
+func bodyBytesToString(data []byte, maxBodyBytes int64) string {
+	truncated := false
+	if int64(len(data)) > maxBodyBytes {
+		data = data[:maxBodyBytes]
+		truncated = true
+	}
+
+	var text string
+	if utf8.Valid(data) {
+		text = string(data)
+	} else {
+		text = "base64:" + base64.StdEncoding.EncodeToString(data)
+	}
+	if truncated {
+		text += "\n[truncated]"
+	}
+	return text
+}
+
 func runSessionCleanup(store *sessionStore, cfg config, stats *processingStats, stop <-chan struct{}) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -134,7 +159,7 @@ func runSessionCleanup(store *sessionStore, cfg config, stats *processingStats, 
 			removed, parsed := store.cleanupExpired(time.Now().Add(-cfg.sessionTTL), func(state *StreamState) int {
 				state.mu.Lock()
 				defer state.mu.Unlock()
-				return drainParsedConversations(cfg, stats, state, true)
+				return drainStream(cfg, stats, state, true)
 			})
 			if removed > 0 {
 				atomic.AddUint64(&stats.expiredSessions, uint64(removed))

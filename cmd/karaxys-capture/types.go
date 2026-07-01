@@ -14,6 +14,8 @@ const (
 	eventTypeClose  uint8 = 1
 	eventTypeSocket uint8 = 2
 
+	eventFlagSSL uint8 = 1
+
 	directionRead  uint8 = 0
 	directionWrite uint8 = 1
 
@@ -201,6 +203,9 @@ type StreamState struct {
 	PendingReqs   []parsedRequest
 	LastSeq       uint32
 	HasLastSeq    bool
+	Ssl           bool
+	H2            bool
+	H2Emitted     map[uint32]bool
 	CaptureSource string
 	CaptureMode   string
 	Connection    ConnectionMetadata

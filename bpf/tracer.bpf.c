@@ -17,6 +17,7 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 #define EVENT_DATA 0
 #define EVENT_CLOSE 1
 #define EVENT_SOCKET 2
+#define EVENT_FLAG_SSL 1
 #define DROP_METRIC_MAX 10
 #define CONFIG_KEY_MAX_PAYLOAD_SIZE 0
 #define CONFIG_KEY_CAPTURE_READS 1
@@ -88,6 +89,12 @@ struct user_iovec {
     __u64 iov_len;
 };
 
+struct ssl_args {
+    __u64 buf;
+    __u64 len_out; // 0 for SSL_read/SSL_write; set for the _ex variants, which
+                   // return the byte count through this pointer instead of PT_REGS_RC.
+};
+
 struct socket_key {
     __u32 pid;
     __u32 fd;
@@ -140,13 +147,48 @@ struct sys_exit_ctx {
     __s64 ret;
 };
 
+#define EVENTS_SHARDS 8
+#define EVENTS_SHARD_SIZE (64 * 1024 * 1024)
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    /* 16 MiB. all-pids capture is a high-volume firehose; a small ring overflows
-     * and the kernel drops events at reserve time (DROP_RINGBUF_RESERVE), which
-     * silently loses halves of HTTP conversations and breaks req/resp pairing. */
-    __uint(max_entries, 16 * 1024 * 1024);
-} events SEC(".maps");
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_0 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_1 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_2 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_3 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_4 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_5 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_6 SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, EVENTS_SHARD_SIZE);
+} events_7 SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -161,6 +203,27 @@ struct {
     __type(key, __u64);
     __type(value, struct read_context);
 } active_reads SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_args);
+} active_ssl_reads SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, struct ssl_args);
+} active_ssl_writes SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64);
+    __type(value, __u32);
+} thread_last_fd SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -388,7 +451,13 @@ static __always_inline bool tuple_has_ignored_port(const struct socket_tuple *tu
     return false;
 }
 
+static __always_inline void record_thread_fd(__u32 fd) {
+    __u64 id = bpf_get_current_pid_tgid();
+    bpf_map_update_elem(&thread_last_fd, &id, &fd, BPF_ANY);
+}
+
 static __always_inline bool socket_tuple_allowed(__u32 pid, __u32 fd, __u32 generation) {
+    record_thread_fd(fd);
     struct socket_key key = make_socket_key(pid, fd, generation);
     struct socket_tuple *tuple = bpf_map_lookup_elem(&socket_tuples, &key);
     if (!tuple) {
@@ -529,6 +598,21 @@ static __always_inline __u32 next_seq(__u32 pid, __u32 fd) {
     return 0;
 }
 
+static __always_inline struct api_event *reserve_event(void) {
+    __u32 shard = bpf_get_smp_processor_id() & (EVENTS_SHARDS - 1);
+    switch (shard) {
+    case 0: return bpf_ringbuf_reserve(&events_0, sizeof(struct api_event), 0);
+    case 1: return bpf_ringbuf_reserve(&events_1, sizeof(struct api_event), 0);
+    case 2: return bpf_ringbuf_reserve(&events_2, sizeof(struct api_event), 0);
+    case 3: return bpf_ringbuf_reserve(&events_3, sizeof(struct api_event), 0);
+    case 4: return bpf_ringbuf_reserve(&events_4, sizeof(struct api_event), 0);
+    case 5: return bpf_ringbuf_reserve(&events_5, sizeof(struct api_event), 0);
+    case 6: return bpf_ringbuf_reserve(&events_6, sizeof(struct api_event), 0);
+    case 7: return bpf_ringbuf_reserve(&events_7, sizeof(struct api_event), 0);
+    default: return bpf_ringbuf_reserve(&events_0, sizeof(struct api_event), 0);
+    }
+}
+
 static __always_inline int emit_data_chunk(__u64 id,
                                            __u32 pid,
                                            __u32 fd,
@@ -538,7 +622,8 @@ static __always_inline int emit_data_chunk(__u64 id,
                                            __u32 chunk_size,
                                            __u32 original_size,
                                            __u16 chunk_index,
-                                           __u16 chunk_count) {
+                                           __u16 chunk_count,
+                                           __u8 is_ssl) {
     if (!direction_enabled(direction)) {
         inc_drop(DROP_DIRECTION_FILTER);
         return 0;
@@ -552,7 +637,7 @@ static __always_inline int emit_data_chunk(__u64 id,
         return 0;
     }
 
-    struct api_event *event = bpf_ringbuf_reserve(&events, sizeof(struct api_event), 0);
+    struct api_event *event = reserve_event();
     if (!event) {
         inc_drop(DROP_RINGBUF_RESERVE);
         return 0;
@@ -570,7 +655,7 @@ static __always_inline int emit_data_chunk(__u64 id,
     event->chunk_count = chunk_count;
     event->direction = direction;
     event->event_type = EVENT_DATA;
-    event->flags = 0;
+    event->flags = is_ssl ? EVENT_FLAG_SSL : 0;
     fill_event_socket_metadata(event, pid, fd, generation);
 
     if (bpf_probe_read_user(&event->payload, chunk_size, buf) < 0) {
@@ -602,7 +687,8 @@ static __always_inline int emit_data_event(__u64 id,
                                            __u32 count,
                                            __u32 original_size,
                                            __u16 chunk_index,
-                                           __u16 chunk_count) {
+                                           __u16 chunk_count,
+                                           __u8 is_ssl) {
     if (!buf || count == 0) {
         return 0;
     }
@@ -638,13 +724,14 @@ static __always_inline int emit_data_event(__u64 id,
                                    chunk_size,
                                    original_size,
                                    chunk_index + (__u16)i,
-                                   chunk_count > chunks ? chunk_count : chunks);
+                                   chunk_count > chunks ? chunk_count : chunks,
+                                   is_ssl);
     }
     return emitted;
 }
 
 static __always_inline int emit_write_event(__u64 id, __u32 pid, __u32 fd, __u32 generation, const char *buf, size_t count) {
-    return emit_data_event(id, pid, fd, generation, DIR_WRITE, buf, (__u32)count, (__u32)count, 0, 1);
+    return emit_data_event(id, pid, fd, generation, DIR_WRITE, buf, (__u32)count, (__u32)count, 0, 1, 0);
 }
 
 static __always_inline int read_iovec_entry(__u64 iov_addr, __u32 index, struct user_iovec *iov) {
@@ -747,7 +834,8 @@ static __always_inline int emit_writev_events(__u64 id,
                         chunk_size,
                         (__u32)iov.iov_len,
                         chunk_index,
-                        chunk_count);
+                        chunk_count,
+                        0);
         chunk_index++;
     }
 
@@ -759,7 +847,7 @@ static __always_inline int emit_control_event(__u64 id,
                                               __u32 fd,
                                               __u32 generation,
                                               __u8 event_type) {
-    struct api_event *event = bpf_ringbuf_reserve(&events, sizeof(struct api_event), 0);
+    struct api_event *event = reserve_event();
     if (!event) {
         inc_drop(DROP_RINGBUF_RESERVE);
         return 0;
@@ -876,7 +964,8 @@ static __always_inline int emit_readv_events(__u64 id, __u32 pid, struct read_co
                         chunk_size,
                         seg_len,
                         chunk_index,
-                        chunk_count);
+                        chunk_count,
+                        0);
         chunk_index++;
         remaining -= seg_len;
     }
@@ -914,7 +1003,8 @@ static __always_inline int emit_simple_read_event(__u64 id, __u32 pid, long ret)
                     max_copy,
                     total_read,
                     0,
-                    1);
+                    1,
+                    0);
 
     bpf_map_delete_elem(&active_reads, &id);
     return 0;
@@ -1436,4 +1526,101 @@ int trace_sys_exit_accept4(void *ctx_void) {
     promote_accepted_socket(id, pid, fd, generation);
     bpf_map_delete_elem(&active_accepts, &id);
     return emit_socket_event(id, pid, fd, generation);
+}
+
+// The socket fd is resolved version-independently: the underlying read/write
+// syscall fires during the SSL_* call and records the thread's fd, which the
+// return probe reads back. This avoids version-specific SSL struct offsets.
+static __always_inline void ssl_store_buf(void *args_map, void *buf, __u64 len_out) {
+    __u64 id = bpf_get_current_pid_tgid();
+    if (!should_trace(id >> 32)) {
+        return;
+    }
+    struct ssl_args args = {};
+    args.buf = (__u64)buf;
+    args.len_out = len_out;
+    bpf_map_update_elem(args_map, &id, &args, BPF_ANY);
+}
+
+static __always_inline int ssl_emit_ret(void *args_map, struct pt_regs *ctx, __u8 direction) {
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+    struct ssl_args *args = bpf_map_lookup_elem(args_map, &id);
+    if (!args) {
+        return 0;
+    }
+    __u64 buf = args->buf;
+    __u64 len_out = args->len_out;
+    bpf_map_delete_elem(args_map, &id);
+
+    long ret = PT_REGS_RC(ctx);
+    if (ret <= 0 || buf == 0) {
+        return 0;
+    }
+
+    __u32 actual_len;
+    if (len_out != 0) {
+        // _ex variants: return value is a 1/0 success flag, actual byte count
+        // is written through the len_out pointer captured at function entry.
+        __u64 written = 0;
+        if (bpf_probe_read_user(&written, sizeof(written), (void *)len_out) < 0 || written == 0) {
+            return 0;
+        }
+        actual_len = (__u32)written;
+    } else {
+        actual_len = (__u32)ret;
+    }
+
+    __u32 *fd = bpf_map_lookup_elem(&thread_last_fd, &id);
+    if (!fd) {
+        return 0;
+    }
+    __u32 generation = get_or_init_generation(pid, *fd);
+    emit_data_event(id, pid, *fd, generation, direction,
+                    (const char *)buf, actual_len, actual_len, 0, 1, 1);
+    return 0;
+}
+
+SEC("uprobe/probe_entry_SSL_write")
+int BPF_UPROBE(probe_entry_SSL_write, void *ssl, void *buf, int num) {
+    ssl_store_buf(&active_ssl_writes, buf, 0);
+    return 0;
+}
+
+SEC("uretprobe/probe_ret_SSL_write")
+int BPF_URETPROBE(probe_ret_SSL_write) {
+    return ssl_emit_ret(&active_ssl_writes, ctx, DIR_WRITE);
+}
+
+SEC("uprobe/probe_entry_SSL_read")
+int BPF_UPROBE(probe_entry_SSL_read, void *ssl, void *buf, int num) {
+    ssl_store_buf(&active_ssl_reads, buf, 0);
+    return 0;
+}
+
+SEC("uretprobe/probe_ret_SSL_read")
+int BPF_URETPROBE(probe_ret_SSL_read) {
+    return ssl_emit_ret(&active_ssl_reads, ctx, DIR_READ);
+}
+
+SEC("uprobe/probe_entry_SSL_write_ex")
+int BPF_UPROBE(probe_entry_SSL_write_ex, void *ssl, void *buf, __u64 num, void *written) {
+    ssl_store_buf(&active_ssl_writes, buf, (__u64)written);
+    return 0;
+}
+
+SEC("uretprobe/probe_ret_SSL_write_ex")
+int BPF_URETPROBE(probe_ret_SSL_write_ex) {
+    return ssl_emit_ret(&active_ssl_writes, ctx, DIR_WRITE);
+}
+
+SEC("uprobe/probe_entry_SSL_read_ex")
+int BPF_UPROBE(probe_entry_SSL_read_ex, void *ssl, void *buf, __u64 num, void *readbytes) {
+    ssl_store_buf(&active_ssl_reads, buf, (__u64)readbytes);
+    return 0;
+}
+
+SEC("uretprobe/probe_ret_SSL_read_ex")
+int BPF_URETPROBE(probe_ret_SSL_read_ex) {
+    return ssl_emit_ret(&active_ssl_reads, ctx, DIR_READ);
 }

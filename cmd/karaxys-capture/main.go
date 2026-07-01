@@ -1,14 +1,3 @@
-// karaxys-capture is a self-contained eBPF HTTP traffic capture agent.
-// It combines the eBPF ring-buffer reader and the HTTP conversation assembler
-// into a single process connected by an in-memory channel — no Kafka required.
-//
-// Usage (typical Docker run):
-//
-//	docker run --rm --privileged --network host \
-//	    -e KARAXYS_INGEST_URL=https://your-backend/v1/ingest/conversations \
-//	    -e KARAXYS_ACCOUNT_TOKEN=<token> \
-//	    -v /sys/fs/bpf:/sys/fs/bpf \
-//	    karaxys/capture:latest
 package main
 
 import (
@@ -34,6 +23,7 @@ import (
 const (
 	channelBufferSize = 50000
 	captureMode       = "host"
+	eventShards       = 8
 )
 
 // ── Kernel tuple syncer — mirrors our /proc-resolved connections back into the
@@ -249,31 +239,32 @@ func attachOptionalTracepoint(category, name string, prog *ebpf.Program) link.Li
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	ingestURL    := flag.String("ingest-url", os.Getenv("KARAXYS_INGEST_URL"), "Backend ingest endpoint (required)")
+	ingestURL := flag.String("ingest-url", os.Getenv("KARAXYS_INGEST_URL"), "Backend ingest endpoint (required)")
 	accountToken := flag.String("account-token", os.Getenv("KARAXYS_ACCOUNT_TOKEN"), "Account-level bearer token (required)")
-	agentID      := flag.String("agent-id", os.Getenv("KARAXYS_AGENT_ID"), "Optional stable agent identifier")
+	agentID := flag.String("agent-id", os.Getenv("KARAXYS_AGENT_ID"), "Optional stable agent identifier")
 
-	ignorePortsRaw   := flag.String("ignore-ports", "9092,19092,27017,6379,9644,9100", "Comma-separated ports to suppress (Kafka/Mongo/Redis/Prometheus)")
-	targetPortsRaw   := flag.String("target-ports", "", "If set, capture only these TCP ports (empty = all non-ignored)")
-	targetPIDsRaw    := flag.String("target-pids", "", "OPT-IN scoping: capture only these PIDs (comma-separated). Empty = all-pids (capture everything).")
-	targetPIDTree    := flag.Bool("target-pid-tree", false, "When --target-pids is set, also capture descendant processes of those PIDs")
+	ignorePortsRaw := flag.String("ignore-ports", "9092,19092,27017,6379,9644,9100", "Comma-separated ports to suppress (Kafka/Mongo/Redis/Prometheus)")
+	targetPortsRaw := flag.String("target-ports", "", "If set, capture only these TCP ports (empty = all non-ignored)")
+	targetPIDsRaw := flag.String("target-pids", "", "OPT-IN scoping: capture only these PIDs (comma-separated). Empty = all-pids (capture everything).")
+	targetPIDTree := flag.Bool("target-pid-tree", false, "When --target-pids is set, also capture descendant processes of those PIDs")
 	maxPayloadSizeRaw := flag.Int("max-payload-size", maxKernelPayloadSize, "Max bytes copied per syscall in kernel")
 
-	captureInbound  := flag.Bool("capture-inbound", true, "Capture inbound/server-side connections")
+	captureInbound := flag.Bool("capture-inbound", true, "Capture inbound/server-side connections")
 	captureOutbound := flag.Bool("capture-outbound", true, "Capture outbound/client-side connections")
-	captureReads    := flag.Bool("capture-read-syscalls", true, "Kernel gate for read/readv/recvfrom")
-	captureWrites   := flag.Bool("capture-write-syscalls", true, "Kernel gate for write/writev/sendto")
+	captureReads := flag.Bool("capture-read-syscalls", true, "Kernel gate for read/readv/recvfrom")
+	captureWrites := flag.Bool("capture-write-syscalls", true, "Kernel gate for write/writev/sendto")
+	captureTLS := flag.Bool("capture-tls", true, "Attach OpenSSL uprobes to capture decrypted HTTPS traffic")
 
-	allPIDsMax          := flag.Int("all-pids-max", 8192, "Maximum PID count; set <=0 to disable limit")
+	allPIDsMax := flag.Int("all-pids-max", 8192, "Maximum PID count; set <=0 to disable limit")
 	targetRefreshInterval := flag.Duration("target-refresh-interval", 5*time.Second, "Interval to re-scan /proc for new processes")
-	metadataTTL         := flag.Duration("metadata-cache-ttl", 15*time.Second, "Connection/process/container metadata cache TTL")
-	sessionTTL          := flag.Duration("session-ttl", defaultSessionTTL, "Idle session timeout before forced flush")
-	statsInterval       := flag.Duration("stats-interval", defaultStatsInterval, "Periodic stats log interval")
-	maxBodyBytes        := flag.Int64("max-body-bytes", defaultMaxBodyBytes, "Max bytes captured per HTTP body")
-	httpTimeout         := flag.Duration("http-timeout", defaultHTTPTimeout, "HTTP POST timeout to backend")
-	httpMaxRetries      := flag.Int("http-max-retries", defaultHTTPMaxRetries, "Max POST retry attempts per conversation")
-	deadLetterFile      := flag.String("dead-letter-file", os.Getenv("KARAXYS_DEAD_LETTER_FILE"), "Optional path to JSONL dead-letter file on emit failure")
-	debugPayload        := flag.Bool("debug-payload", false, "Log raw payload routing decisions (verbose)")
+	metadataTTL := flag.Duration("metadata-cache-ttl", 15*time.Second, "Connection/process/container metadata cache TTL")
+	sessionTTL := flag.Duration("session-ttl", defaultSessionTTL, "Idle session timeout before forced flush")
+	statsInterval := flag.Duration("stats-interval", defaultStatsInterval, "Periodic stats log interval")
+	maxBodyBytes := flag.Int64("max-body-bytes", defaultMaxBodyBytes, "Max bytes captured per HTTP body")
+	httpTimeout := flag.Duration("http-timeout", defaultHTTPTimeout, "HTTP POST timeout to backend")
+	httpMaxRetries := flag.Int("http-max-retries", defaultHTTPMaxRetries, "Max POST retry attempts per conversation")
+	deadLetterFile := flag.String("dead-letter-file", os.Getenv("KARAXYS_DEAD_LETTER_FILE"), "Optional path to JSONL dead-letter file on emit failure")
+	debugPayload := flag.Bool("debug-payload", false, "Log raw payload routing decisions (verbose)")
 
 	flag.Parse()
 
@@ -484,11 +475,19 @@ func main() {
 
 	// ── Ring buffer ───────────────────────────────────────────────────────────
 
-	rd, err := ringbuf.NewReader(objs.Events)
-	if err != nil {
-		log.Fatalf("Opening ringbuf reader: %s", err)
+	eventMaps := [eventShards]*ebpf.Map{
+		objs.Events0, objs.Events1, objs.Events2, objs.Events3,
+		objs.Events4, objs.Events5, objs.Events6, objs.Events7,
 	}
-	defer rd.Close()
+	readers := [eventShards]*ringbuf.Reader{}
+	for i, m := range eventMaps {
+		rd, err := ringbuf.NewReader(m)
+		if err != nil {
+			log.Fatalf("Opening ringbuf reader shard %d: %s", i, err)
+		}
+		defer rd.Close()
+		readers[i] = rd
+	}
 
 	// ── Signal handling ───────────────────────────────────────────────────────
 
@@ -498,11 +497,12 @@ func main() {
 
 	stopCh := make(chan struct{})
 
-	// Close ring buffer on signal — causes the capture loop to exit naturally.
 	go func() {
 		<-stopper
 		log.Println("Signal received, shutting down...")
-		rd.Close()
+		for _, rd := range readers {
+			rd.Close()
+		}
 	}()
 
 	// ── In-process channel ────────────────────────────────────────────────────
@@ -512,7 +512,7 @@ func main() {
 	// ── Processing goroutine ─────────────────────────────────────────────────
 
 	pStats := &processingStats{}
-	store  := newSessionStore(*sessionTTL)
+	store := newSessionStore(*sessionTTL)
 
 	go runSessionCleanup(store, cfg, pStats, stopCh)
 	go runProcessingStats(pStats, *statsInterval, stopCh)
@@ -531,11 +531,19 @@ func main() {
 
 	go targetMgr.run(*targetRefreshInterval, stopCh)
 
+	// ── TLS uprobes ───────────────────────────────────────────────────────────
+
+	if *captureTLS {
+		sslAtt := newSSLAttacher(&objs)
+		defer sslAtt.close()
+		go sslAtt.run(*targetRefreshInterval, stopCh)
+	}
+
 	// ── Metadata + kernel tuple syncer ────────────────────────────────────────
 
-	metaResolver  := newMetadataResolver(*metadataTTL)
-	kernelTuples  := newKernelTupleSyncer(objs.SocketTuples)
-	filter        := newFlowFilter(*metadataTTL, targetPorts, ignorePorts, *captureInbound, *captureOutbound)
+	metaResolver := newMetadataResolver(*metadataTTL)
+	kernelTuples := newKernelTupleSyncer(objs.SocketTuples)
+	filter := newFlowFilter(*metadataTTL, targetPorts, ignorePorts, *captureInbound, *captureOutbound)
 
 	// ── Capture stats goroutine ───────────────────────────────────────────────
 
@@ -558,24 +566,64 @@ func main() {
 
 	// ── Ring buffer capture loop ──────────────────────────────────────────────
 
+	shardDeps := &shardCaptureDeps{
+		cStats:       cStats,
+		eventCh:      eventCh,
+		kernelTuples: kernelTuples,
+		metaResolver: metaResolver,
+		filter:       filter,
+	}
+
+	var wg sync.WaitGroup
+	for i, rd := range readers {
+		wg.Add(1)
+		go func(shardID int, rd *ringbuf.Reader) {
+			defer wg.Done()
+			runShardCapture(shardID, rd, shardDeps)
+		}(i, rd)
+	}
+	wg.Wait()
+
+	// ── Shutdown ──────────────────────────────────────────────────────────────
+
+	close(stopCh)
+	close(eventCh) // signals processing goroutine to flush and exit
+
+	// Give the processing goroutine a moment to drain the channel.
+	time.Sleep(2 * time.Second)
+
+	logCaptureStats("shutdown", cStats)
+	logKernelDrops(objs.DropMetrics)
+	log.Println("karaxys-capture exited cleanly.")
+}
+
+type shardCaptureDeps struct {
+	cStats       *captureStats
+	eventCh      chan CaptureEvent
+	kernelTuples *kernelTupleSyncer
+	metaResolver *metadataResolver
+	filter       *flowFilter
+}
+
+func runShardCapture(shardID int, rd *ringbuf.Reader, deps *shardCaptureDeps) {
+	cStats := deps.cStats
+
 	var bpfEvent bpf.ApiEvent
-loop:
 	for {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("Ring buffer closed, exiting capture loop.")
-				break loop
+				return
 			}
 			atomic.AddUint64(&cStats.ringReadErrors, 1)
-			log.Printf("Ring buffer read error: %s", err)
+			log.Printf("shard %d: ring buffer read error: %s", shardID, err)
 			continue
 		}
 		atomic.AddUint64(&cStats.ringRecords, 1)
 
 		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &bpfEvent); err != nil {
 			atomic.AddUint64(&cStats.decodeErrors, 1)
-			log.Printf("Failed to decode ring buffer event: %v", err)
+			log.Printf("shard %d: failed to decode ring buffer event: %v", shardID, err)
 			continue
 		}
 		atomic.AddUint64(&cStats.decodedEvents, 1)
@@ -602,7 +650,6 @@ loop:
 			atomic.AddUint64(&cStats.truncatedEvents, 1)
 		}
 
-		// Payload bytes — copy out of the BPF record buffer before it's recycled.
 		payload := make([]byte, payloadSize)
 		copy(payload, bpfEvent.Payload[:payloadSize])
 
@@ -616,15 +663,13 @@ loop:
 			atomic.AddUint64(&cStats.socketEvents, 1)
 		}
 
-		// Socket events carry no payload and exist only so the kernel can
-		// populate its tuple map; nothing to assemble in userspace.
 		if bpfEvent.EventType == eventTypeSocket {
 			continue
 		}
 
 		if bpfEvent.EventType == eventTypeClose {
-			kernelTuples.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
-			metaResolver.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+			deps.kernelTuples.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
+			deps.metaResolver.forget(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation)
 		}
 
 		if bpfEvent.EventType == eventTypeData && isCounterNoise(payload) {
@@ -632,13 +677,6 @@ loop:
 			continue
 		}
 
-		// ── CHEAP admission decision — NO /proc here ──────────────────────────
-		// The kernel-supplied socket tuple and an HTTP-preamble sniff are both
-		// in-memory checks. Resolving /proc metadata for every one of the
-		// hundreds of thousands of noise events per second starves the ring
-		// buffer reader and causes massive in-kernel ringbuf_reserve drops
-		// (which silently lose halves of real conversations). We therefore admit
-		// on cheap signals first and only pay for /proc enrichment on survivors.
 		conn, metadataOK := connectionFromKernelTuple(bpfEvent)
 		if metadataOK {
 			atomic.AddUint64(&cStats.kernelTupleFallbacks, 1)
@@ -666,15 +704,12 @@ loop:
 			Loss:          loss,
 		}
 
-		if !filter.allow(event, metadataOK) {
+		if !deps.filter.allow(event, metadataOK) {
 			atomic.AddUint64(&cStats.skippedFDFilter, 1)
 			continue
 		}
 
-		// ── EXPENSIVE enrichment — only for admitted events ───────────────────
-		// Now that we know this event belongs to a flow we care about, resolve
-		// process/container/connection metadata from /proc to enrich it.
-		if procConn, proc, container, ok, src := metaResolver.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation); ok {
+		if procConn, proc, container, ok, src := deps.metaResolver.resolveWithSource(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation); ok {
 			switch src {
 			case metadataSourceCache:
 				atomic.AddUint64(&cStats.metadataCacheHits, 1)
@@ -684,7 +719,7 @@ loop:
 			event.Connection = procConn
 			event.Process = proc
 			event.Container = container
-			kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, procConn)
+			deps.kernelTuples.remember(bpfEvent.Pid, bpfEvent.Fd, bpfEvent.Generation, procConn)
 		} else {
 			atomic.AddUint64(&cStats.metadataProcMisses, 1)
 			if !metadataOK && bpfEvent.Fd > 2 {
@@ -692,23 +727,10 @@ loop:
 			}
 		}
 
-		// Non-blocking send: drop rather than stall the ring buffer reader.
 		select {
-		case eventCh <- event:
+		case deps.eventCh <- event:
 		default:
 			atomic.AddUint64(&cStats.channelDropped, 1)
 		}
 	}
-
-	// ── Shutdown ──────────────────────────────────────────────────────────────
-
-	close(stopCh)
-	close(eventCh) // signals processing goroutine to flush and exit
-
-	// Give the processing goroutine a moment to drain the channel.
-	time.Sleep(2 * time.Second)
-
-	logCaptureStats("shutdown", cStats)
-	logKernelDrops(objs.DropMetrics)
-	log.Println("karaxys-capture exited cleanly.")
 }

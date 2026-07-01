@@ -20,9 +20,9 @@ func parseConfig() config {
 	debugPayload := flag.Bool("debug-payload", false, "Log short escaped payload previews while routing events")
 	outputContract := flag.String("output-contract", "normalized", "Output contract: normalized, legacy, or both")
 	outputSink := flag.String("output-sink", envString("KARAXYS_OUTPUT_SINK", defaultOutputSink), "Conversation output sink: stdout, http, or kafka")
-	// Akto-style account-token mode (preferred for new deployments).
+	// Account-token mode (preferred for new deployments).
 	ingestURL    := flag.String("ingest-url", os.Getenv("KARAXYS_INGEST_URL"), "Full URL of the POST /ingest endpoint (e.g. https://karaxys.example.com/ingest)")
-	accountToken := flag.String("account-token", os.Getenv("KARAXYS_ACCOUNT_TOKEN"), "Karaxys account-level ingest token (Akto-style, no enrollment required)")
+	accountToken := flag.String("account-token", os.Getenv("KARAXYS_ACCOUNT_TOKEN"), "Karaxys account-level ingest token (no enrollment required)")
 	// Legacy enrollment-based mode (kept for backward compat).
 	backendURL := flag.String("backend-url", os.Getenv("KARAXYS_BACKEND_URL"), "Karaxys backend base URL for HTTP sink (legacy; use -ingest-url instead)")
 	agentToken := flag.String("agent-token", os.Getenv("KARAXYS_AGENT_TOKEN"), "Karaxys per-agent token for HTTP sink (legacy; use -account-token instead)")
