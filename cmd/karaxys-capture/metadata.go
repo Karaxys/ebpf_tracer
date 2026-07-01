@@ -21,10 +21,10 @@ import (
 )
 
 const (
-	containerMetadataTTL    = 5 * time.Minute
-	externalMetadataTimeout = 500 * time.Millisecond
-	defaultDockerSocketPath = "/var/run/docker.sock"
-	serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	containerMetadataTTL     = 5 * time.Minute
+	externalMetadataTimeout  = 500 * time.Millisecond
+	defaultDockerSocketPath  = "/var/run/docker.sock"
+	serviceAccountTokenPath  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	serviceAccountCACertPath = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
@@ -282,7 +282,7 @@ type metadataCacheEntry struct {
 type metadataSource uint8
 
 const (
-	metadataSourceNone  metadataSource = iota
+	metadataSourceNone metadataSource = iota
 	metadataSourceCache
 	metadataSourceProc
 )
@@ -503,17 +503,7 @@ func isLikelyHTTPPayload(payload []byte) bool {
 	if len(payload) > 64 {
 		payload = payload[:64]
 	}
-	prefixes := [][]byte{
-		[]byte("GET "), []byte("POST "), []byte("PUT "), []byte("PATCH "),
-		[]byte("DELETE "), []byte("HEAD "), []byte("OPTIONS "), []byte("TRACE "),
-		[]byte("CONNECT "), []byte("HTTP/1."),
-	}
-	for _, prefix := range prefixes {
-		if len(payload) >= len(prefix) && string(payload[:len(prefix)]) == string(prefix) {
-			return true
-		}
-	}
-	return false
+	return classifyPayload(payload) != payloadUnknown
 }
 
 // ── Container metadata ────────────────────────────────────────────────────────
@@ -845,4 +835,3 @@ func firstNonEmptyEnv(keys ...string) string {
 	}
 	return ""
 }
-

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -103,6 +104,24 @@ func portSetFromInts(values []int) portSet {
 	return out
 }
 
+var httpPayloadMarkers = [][]byte{
+	[]byte("GET "),
+	[]byte("POST "),
+	[]byte("PUT "),
+	[]byte("PATCH "),
+	[]byte("DELETE "),
+	[]byte("HEAD "),
+	[]byte("OPTIONS "),
+	[]byte("TRACE "),
+	[]byte("CONNECT "),
+	[]byte("HTTP/1."),
+}
+
+// isLikelyHTTPPayload scans for a request/response marker anywhere in the
+// chunk rather than requiring it at byte 0: a marker only ever sits at byte 0
+// for the very first captured chunk of a stream, so an offset-0-only check
+// silently drops every later chunk once metadata-based admission is unusable
+// (e.g. under heavy /proc resolution misses on a noisy multi-service host).
 func isLikelyHTTPPayload(payload []byte) bool {
 	if len(payload) == 0 {
 		return false
@@ -110,20 +129,8 @@ func isLikelyHTTPPayload(payload []byte) bool {
 	if len(payload) > 64 {
 		payload = payload[:64]
 	}
-	prefixes := [][]byte{
-		[]byte("GET "),
-		[]byte("POST "),
-		[]byte("PUT "),
-		[]byte("PATCH "),
-		[]byte("DELETE "),
-		[]byte("HEAD "),
-		[]byte("OPTIONS "),
-		[]byte("TRACE "),
-		[]byte("CONNECT "),
-		[]byte("HTTP/1."),
-	}
-	for _, prefix := range prefixes {
-		if len(payload) >= len(prefix) && string(payload[:len(prefix)]) == string(prefix) {
+	for _, marker := range httpPayloadMarkers {
+		if bytes.Contains(payload, marker) {
 			return true
 		}
 	}
