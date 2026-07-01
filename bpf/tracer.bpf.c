@@ -613,6 +613,22 @@ static __always_inline struct api_event *reserve_event(void) {
     }
 }
 
+// Clamp the copy length in a separately-compiled subprogram. Marking this
+// __noinline creates an optimization barrier the compiler cannot see through:
+// the caller must take the return value as a genuinely new scalar and cannot
+// fold it back into the raw, unbounded length. When the clamp is instead done
+// inline, emit_data_chunk gets inlined into its many call sites, the length is
+// spilled to the stack across the intervening map lookups, and the reload
+// before bpf_probe_read_user carries the pre-clamp (unbounded) value — the
+// verifier then rejects the read with "R2 unbounded memory access". Returning
+// a bounded scalar from here forces every reload to carry the bound instead.
+static __noinline __u32 clamp_payload_len(__u32 len) {
+    if (len >= MAX_PAYLOAD_SIZE) {
+        len = MAX_PAYLOAD_SIZE - 1;
+    }
+    return len & (MAX_PAYLOAD_SIZE - 1);
+}
+
 static __always_inline int emit_data_chunk(__u64 id,
                                            __u32 pid,
                                            __u32 fd,
@@ -643,20 +659,7 @@ static __always_inline int emit_data_chunk(__u64 id,
         return 0;
     }
 
-    // Bound the copy length with a bitmask computed immediately before the
-    // read, not earlier in the function. A clamp established far from its
-    // point of use (e.g. right after the parameter enters the function) gets
-    // spilled to the stack across the socket_tuple_allowed()/reserve_event()
-    // calls and the event-> field writes above; by the time
-    // bpf_probe_read_user needs it, the compiler can reload the pre-clamp
-    // value from that stack slot instead of the narrowed register, and the
-    // verifier sees the reloaded value as unbounded again. Keeping the mask
-    // adjacent to the read leaves no room for that to happen.
-    __u32 safe_len = chunk_size;
-    if (safe_len >= MAX_PAYLOAD_SIZE) {
-        safe_len = MAX_PAYLOAD_SIZE - 1;
-    }
-    safe_len &= (MAX_PAYLOAD_SIZE - 1);
+    __u32 safe_len = clamp_payload_len(chunk_size);
 
     event->timestamp = bpf_ktime_get_ns();
     event->pid = pid;
