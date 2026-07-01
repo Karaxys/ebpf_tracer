@@ -633,19 +633,6 @@ static __always_inline int emit_data_chunk(__u64 id,
         return 0;
     }
 
-    // Re-bound chunk_size with an explicit bitmask right before use, rather
-    // than trusting the callers' `if (chunk_size > MAX_PAYLOAD_SIZE) ...`
-    // clamps alone. This function is __always_inline and gets inlined
-    // separately at every call site (regular read/write, readv/writev,
-    // SSL variants); a bound proven by an `if` in one caller's instruction
-    // stream isn't guaranteed to survive the different register/stack
-    // allocation the verifier computes for another. A mask is a bound the
-    // verifier can always prove independent of the path that reached here.
-    if (chunk_size >= MAX_PAYLOAD_SIZE) {
-        chunk_size = MAX_PAYLOAD_SIZE - 1;
-    }
-    chunk_size &= (MAX_PAYLOAD_SIZE - 1);
-
     if (!socket_tuple_allowed(pid, fd, generation)) {
         return 0;
     }
@@ -656,13 +643,28 @@ static __always_inline int emit_data_chunk(__u64 id,
         return 0;
     }
 
+    // Bound the copy length with a bitmask computed immediately before the
+    // read, not earlier in the function. A clamp established far from its
+    // point of use (e.g. right after the parameter enters the function) gets
+    // spilled to the stack across the socket_tuple_allowed()/reserve_event()
+    // calls and the event-> field writes above; by the time
+    // bpf_probe_read_user needs it, the compiler can reload the pre-clamp
+    // value from that stack slot instead of the narrowed register, and the
+    // verifier sees the reloaded value as unbounded again. Keeping the mask
+    // adjacent to the read leaves no room for that to happen.
+    __u32 safe_len = chunk_size;
+    if (safe_len >= MAX_PAYLOAD_SIZE) {
+        safe_len = MAX_PAYLOAD_SIZE - 1;
+    }
+    safe_len &= (MAX_PAYLOAD_SIZE - 1);
+
     event->timestamp = bpf_ktime_get_ns();
     event->pid = pid;
     event->tid = (__u32)id;
     event->fd = fd;
     event->generation = generation;
     event->seq = next_seq(pid, fd);
-    event->size = chunk_size;
+    event->size = safe_len;
     event->original_size = original_size;
     event->chunk_index = chunk_index;
     event->chunk_count = chunk_count;
@@ -671,7 +673,7 @@ static __always_inline int emit_data_chunk(__u64 id,
     event->flags = is_ssl ? EVENT_FLAG_SSL : 0;
     fill_event_socket_metadata(event, pid, fd, generation);
 
-    if (bpf_probe_read_user(&event->payload, chunk_size, buf) < 0) {
+    if (bpf_probe_read_user(&event->payload, safe_len, buf) < 0) {
         if (direction == DIR_WRITE) {
             inc_drop(DROP_COPY_WRITE);
         } else {
@@ -688,7 +690,7 @@ static __always_inline int emit_data_chunk(__u64 id,
     }
 
     bpf_ringbuf_submit(event, 0);
-    return chunk_size;
+    return safe_len;
 }
 
 static __always_inline int emit_data_event(__u64 id,
@@ -728,17 +730,6 @@ static __always_inline int emit_data_event(__u64 id,
         }
         __u32 remaining = capture_size - offset;
         __u32 chunk_size = remaining < MAX_PAYLOAD_SIZE ? remaining : MAX_PAYLOAD_SIZE;
-        // Re-assert the same hard bound emit_data_chunk applies internally,
-        // here too: capture_size derives from a runtime-configurable map
-        // value (effective_max_payload_size), and this call site is a
-        // separately-verified inlined copy of emit_data_chunk from the one
-        // reached via emit_readv_events. A bound established once doesn't
-        // reliably survive re-inlining at a different, more complex call
-        // site (this chain: ssl_emit_ret -> emit_data_event -> here).
-        if (chunk_size >= MAX_PAYLOAD_SIZE) {
-            chunk_size = MAX_PAYLOAD_SIZE - 1;
-        }
-        chunk_size &= (MAX_PAYLOAD_SIZE - 1);
         emitted += emit_data_chunk(id,
                                    pid,
                                    fd,
