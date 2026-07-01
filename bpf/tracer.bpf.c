@@ -633,6 +633,19 @@ static __always_inline int emit_data_chunk(__u64 id,
         return 0;
     }
 
+    // Re-bound chunk_size with an explicit bitmask right before use, rather
+    // than trusting the callers' `if (chunk_size > MAX_PAYLOAD_SIZE) ...`
+    // clamps alone. This function is __always_inline and gets inlined
+    // separately at every call site (regular read/write, readv/writev,
+    // SSL variants); a bound proven by an `if` in one caller's instruction
+    // stream isn't guaranteed to survive the different register/stack
+    // allocation the verifier computes for another. A mask is a bound the
+    // verifier can always prove independent of the path that reached here.
+    if (chunk_size >= MAX_PAYLOAD_SIZE) {
+        chunk_size = MAX_PAYLOAD_SIZE - 1;
+    }
+    chunk_size &= (MAX_PAYLOAD_SIZE - 1);
+
     if (!socket_tuple_allowed(pid, fd, generation)) {
         return 0;
     }
